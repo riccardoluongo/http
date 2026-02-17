@@ -1,6 +1,4 @@
-#include <stddef.h>
 #include <stdint.h>
-#include <arpa/inet.h>
 
 #define MAX_HEADERS 64
 #define N_MIME_TYPES 20
@@ -15,6 +13,7 @@
 #define GET_METHOD 0
 #define HEAD_METHOD 1
 #define QUEUE_CAPACITY 1024
+#define MAX_HEADER_VALUES 16
 
 typedef enum {
     LOG_DEBUG,
@@ -25,16 +24,15 @@ typedef enum {
 
 typedef struct Header {
     char *key;
-    char **values;
+    char *values[MAX_HEADER_VALUES];
     void *next;
 
-    uint8_t n_values; // Specifies the number of values the header has. This will only be above one if the duplicated headers can be combined safely
-    uint8_t semicolon_separated; // Specifies wether the header's values should be separated with a semicolon (1) or with a comma (0)
+    uint8_t n_values; // Specifies the number of values the header has.
+    uint8_t can_combine; // Specifies if the header can be combined in a comma or semicolon separated list. If set to 1, only the first or last value should be read.
 } Header;
 
 typedef struct{
     Header *arr;
-    uint8_t items;
     uint16_t capacity;
 } ht;
 
@@ -50,6 +48,6 @@ struct date_enum{
 
 ht * ht_alloc(uint8_t max_headers);
 void ht_free(ht *table);
-char * get_header(ht* table, char* key);
+Header * get_header(ht *table, char *key);
 int8_t set_header(ht* table, char* header);
 int8_t headercheck(const char *key);

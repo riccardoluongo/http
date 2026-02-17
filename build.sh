@@ -1,1 +1,1 @@
-gcc main.c hashtable.c headercheck.c -o server
+gcc main.c hashtable.c -o server

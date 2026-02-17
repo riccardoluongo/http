@@ -142,7 +142,7 @@ void get_1123_date(char *buf, uint8_t bufsize){
     strftime(buf, bufsize, "%a, %d %b %Y %H:%M:%S GMT", &t);
 }
 
-// Convert RFC 1123 time string into timestamp
+// Convert RFC 1123 time string into timestamp.
 // Return timestamp on success, -1 on pattern matching failure and -2 on invalid date
 time_t string_to_timestamp(char *s){
     static const struct date_enum months[12] = {
@@ -444,19 +444,12 @@ int8_t parse_request(char *req_buf, uint16_t reqline_len, uint16_t headers_len, 
 
     char *header_end; // Used in the loop below to point to the end of the current header
     while(headers_ptr < headers_end){
-        if(headers_table->items > max_headers || headers_table->items > 254) // The second limit is to prevent overflows of the max_headers variable (who needs that many headers anyways?)
-            return -1;
-
         if((header_end = memmem(headers_ptr, headers_end - headers_ptr, "\r\n", 2)) == NULL)
             return -1;
         *header_end = '\0';
 
-        switch(set_header(headers_table, headers_ptr)){
-            case -1: case -2:
-                return -2;
-            case 3:
-                return -1;
-        }
+        if(set_header(headers_table, headers_ptr) < 0)
+            return -1;
 
         headers_ptr = header_end + 2;
     }
@@ -471,7 +464,7 @@ void worker_cleanup(struct worker_thread_cleanup *struct_ptr){
     for(uint8_t i = 0; i < struct_ptr->n_fds; i++)
         if(struct_ptr->fds[i] != -1) close(struct_ptr->fds[i]);
 
-    ht_free(struct_ptr->headers_table);
+    memset(struct_ptr->headers_table->arr, 0, struct_ptr->headers_table->capacity * sizeof(Header));
 }
 
 void * handle_client(void *arg){
@@ -494,6 +487,15 @@ void * handle_client(void *arg){
         .n_ptrs = 0,
         .n_fds = 2
     };
+
+    if((headers_table = ht_alloc(max_headers)) == NULL){
+        print_server_log("could not allocate headers table: %s", LOG_ERR, stderr, 1, strerror(errno));
+
+        worker_cleanup(&cleanup_struct);
+        pthread_exit(NULL); // TODO err handling in main
+    }
+
+    cleanup_struct.headers_table = headers_table;
 
     while(1){
         cleanup_struct.fds[0] = sockfd = dequeue();
@@ -518,15 +520,6 @@ void * handle_client(void *arg){
             worker_cleanup(&cleanup_struct);
             continue;
         }
-
-        if((headers_table = ht_alloc(max_headers)) == NULL){
-            print_server_log("could not allocate headers table: %s", LOG_ERR, stderr, 1, strerror(errno));
-
-            worker_cleanup(&cleanup_struct);
-            continue;
-	    }
-
-    	cleanup_struct.headers_table = headers_table;
 
         request_method = parse_request(req_buf, reqline_len, headers_len, max_headers, headers_table);
         if(request_method < 0){
@@ -595,13 +588,11 @@ void * handle_client(void *arg){
             continue;
         }
 
-        char *if_modified_since = get_header(headers_table, "if-modified-since");
+        Header *if_modified_since = get_header(headers_table, "if-modified-since");
         MimeType *bsearch_rv;
 
-        cleanup_struct.ptrs[(cleanup_struct.n_ptrs = 1)] = if_modified_since;
-
         if(if_modified_since != NULL){
-            time_t header_timestamp = string_to_timestamp(if_modified_since);
+            time_t header_timestamp = string_to_timestamp(if_modified_since->values[0]);
 
             if(header_timestamp < 0){
                 print_request_log(client_addr, path, "could not calculate if-modified-since timestamp (%d)", LOG_ERR, stderr, 1, header_timestamp);
@@ -663,7 +654,7 @@ int main(int argc, char ** argv){
                 max_headers = max_headers_input > 0 ? max_headers_input : MAX_HEADERS;
                 break;
             case 'b':
-                if((backlog = atoi(argv[i+1])) > 254 || backlog < 1){ // TODO fix overflow problem
+                if((backlog = atoi(argv[i+1])) > 254 || backlog < 1){
                     fprintf(stderr, "invalid backlog number. Choose one between 1 and 254");
                     exit(-1);
                 }

@@ -1,4 +1,8 @@
 #include <stdint.h>
+#include <pthread.h>
+#include <stdlib.h>
+#include <stdarg.h>
+#include <stdio.h>
 
 #define MAX_HEADERS 64
 #define N_MIME_TYPES 20
@@ -12,15 +16,18 @@
 #define ERR_304 3
 #define GET_METHOD 0
 #define HEAD_METHOD 1
-#define QUEUE_CAPACITY 1024
+#define CONN_QUEUE_LEN 1024
 #define MAX_HEADER_VALUES 16
+#define LOG_HEADER_LEN 48
+#define LOG_MSG_BUF_LEN 256
+#define TIME_BUF_SIZE 32
 
-typedef enum {
+enum log_level{
     LOG_DEBUG,
     LOG_INFO,
     LOG_WARN,
     LOG_ERR
-} LOG_LEVEL;
+};
 
 typedef struct Header {
     char *key;
@@ -41,6 +48,17 @@ typedef struct {
     const char *mime_type;
 } MimeType;
 
+typedef struct {
+    int fds[CONN_QUEUE_LEN];
+
+    int16_t front;
+    int16_t rear;
+
+    pthread_mutex_t mutex;
+    pthread_cond_t not_full;
+    pthread_cond_t not_empty;
+} fd_queue;
+
 struct date_enum{
     char *name;
     uint8_t num;
@@ -51,3 +69,7 @@ void ht_free(ht *table);
 Header * get_header(ht *table, char *key);
 int8_t set_header(ht* table, char* header);
 int8_t headercheck(const char *key);
+
+fd_queue * fd_queue_alloc();
+void fd_enqueue(int fd, fd_queue *queue);
+int fd_dequeue(fd_queue *queue);

@@ -1,1 +1,1 @@
-gcc main.c hashtable.c -o server
+gcc main.c hashtable.c queue.c -o server

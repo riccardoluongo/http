@@ -1,5 +1,6 @@
 #include <ctype.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 
@@ -63,7 +64,7 @@ ht* ht_alloc(uint8_t max_headers){
 }
 
 int compare(const void *s1, const void *s2){
-    return(strcmp(*(const char **)s1, *(const char **)s2));
+    return(strcmp(s1, s2));
 }
 
 // Look for an header in the hash table and return a pointer to its value if it exists, otherwise NULL.
@@ -72,9 +73,9 @@ Header * get_header(ht *table, char *key){
     uint16_t i, starting_index, totalsize = 0;
     int8_t val_index, rv, n_values;
     char *value;
-    
+
     i = starting_index = hash(key) % table->capacity;
-    
+
     if(table->arr[i].key == NULL)
         return NULL;
 
@@ -106,17 +107,12 @@ int8_t set_header(ht* table, char* headerptr){ //TODO differentiate error codes 
 
     for(char *strptr = headerptr; *strptr; strptr++) // Convert header key to lowercase
         *strptr = tolower(*strptr);
-
     i = starting_index = hash(headerptr) % table->capacity;
 
-    while(table->arr[i].key != NULL){
-        if((i = (i+1) % table->capacity) == starting_index) // Table is full!!
+    while(table->arr[i].key != NULL && strcmp(table->arr[i].key, headerptr) != 0)
+        if((i = (i+1) % table->capacity) == starting_index)
             return -1;
 
-        if(strcmp(table->arr[i].key, headerptr) == 0)
-            break;
-    }
-   
     if(table->arr[i].n_values + 1 > MAX_HEADER_VALUES)
         return -1;
 

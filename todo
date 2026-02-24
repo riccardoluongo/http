@@ -1,4 +1,11 @@
-makefile
 headers
 ipv6 support
 fix header files
+request struct and extensibility (maybe with function pointer)
+chunked transfer encoding
+file browser
+keep conn alive
+nonblocking sockets
+fix cli arg parsing
+use strtok
+start logging inside functions, who gives a shit

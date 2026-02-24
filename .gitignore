@@ -1,4 +1,6 @@
 resources
 *.html
-server
-todo
+*.tmp
+*.sync-conflict*
+*server*
+*todo*

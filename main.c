@@ -1,4 +1,3 @@
-
 #ifdef __STDC_NO_THREADS__
     #error Multithreading support is required to compile this program!
 #endif
@@ -6,7 +5,6 @@
 #include <ctype.h>
 #include <iso646.h>
 #include <linux/limits.h>
-#include <stdint.h>
 #include <string.h>
 #include <strings.h>
 #include <sys/types.h>
@@ -16,7 +14,6 @@
 #include <netdb.h>
 #include <arpa/inet.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <sys/sendfile.h>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -24,7 +21,6 @@
 #include <linux/openat2.h>
 #include <sys/syscall.h>
 #include <time.h>
-#include <pthread.h>
 #include <errno.h>
 #include <stdarg.h>
 
@@ -52,10 +48,11 @@ MimeType mime_types[N_MIME_TYPES] = {
     { ".vtt", "text/vtt" },
     { ".xml", "application/xml" }
 };
-// anna ti amo tantissimo
+
 uint8_t max_headers = MAX_HEADERS;
-LOG_LEVEL log_level = LOG_DEBUG;
+enum log_level log_level = LOG_DEBUG;
 char *index_page = "/index.html";
+fd_queue *conn_queue;
 const struct open_how how = {
     .flags = O_RDONLY,
     .mode = 0,
@@ -74,56 +71,6 @@ struct worker_thread_cleanup{
 
     uint8_t n_ptrs, n_fds;
 };
-typedef struct {
-    int fds[QUEUE_CAPACITY];
-    int16_t front;
-    int16_t rear;
-
-    pthread_mutex_t mutex;
-    pthread_cond_t not_full;
-    pthread_cond_t not_empty;
-} conn_queue;
-conn_queue queue = {
-    .front = -1,
-    .rear = -1,
-
-    .mutex = PTHREAD_MUTEX_INITIALIZER,
-    .not_empty = PTHREAD_COND_INITIALIZER,
-    .not_full = PTHREAD_COND_INITIALIZER
-};
-
-void enqueue(int fd){
-    pthread_mutex_lock(&queue.mutex);
-
-    while((queue.front == (queue.rear + 1) % QUEUE_CAPACITY) || (queue.front == 0 && queue.rear == QUEUE_CAPACITY - 1))
-        pthread_cond_wait(&queue.not_full, &queue.mutex);
-
-    if(queue.front == -1)
-        queue.front = 0;
-
-    queue.fds[(queue.rear = (queue.rear + 1) % QUEUE_CAPACITY)] = fd;
-
-    pthread_cond_signal(&queue.not_empty);
-    pthread_mutex_unlock(&queue.mutex);
-}
-
-int dequeue(){
-    pthread_mutex_lock(&queue.mutex);
-
-    while(queue.front == -1)
-        pthread_cond_wait(&queue.not_empty, &queue.mutex);
-
-    int element = queue.fds[queue.front];
-    if(queue.front == queue.rear)
-        queue.front = queue.rear = -1;
-    else
-        queue.front = (queue.front + 1) % QUEUE_CAPACITY;
-
-    pthread_cond_signal(&queue.not_full);
-    pthread_mutex_unlock(&queue.mutex);
-
-    return element;
-}
 
 int strcmp_bsearch_wrapper(const void *a, const void *b){
     return strcmp(a, ((MimeType *)b)->extension);
@@ -177,62 +124,29 @@ time_t string_to_timestamp(char *s){
     return timegm(&tm_struct);
 }
 
-void get_log_date(char *buf, uint8_t bufsize){
+char * get_log_date(char *buf, uint8_t bufsize){
     time_t now = time(NULL);
     struct tm t;
 
     localtime_r(&now, &t);
     strftime(buf, bufsize, "%d/%m/%Y %H:%M:%S", &t);
+
+    return buf;
 }
 
 // Used to print internal log messages related to the server.
 void print_server_log(char *format, uint8_t severity, FILE *output_file, int argc, ...){
     va_list arg_list;
-    char time_buf[32];
+    char log_msg[LOG_MSG_BUF_LEN], time_buf[TIME_BUF_SIZE];
     int rv;
 
-    va_start(arg_list, argc);
-    get_log_date(time_buf, 32);
-
-    if(severity >= log_level){
-        if((rv = fprintf(output_file, "[%s - %s] ", time_buf, log_level_str[severity])) < 0)
-            fprintf(stderr, "error: could not write to log: fprintf failed with %d return value\n", rv);
-
-        if((rv = vfprintf(output_file, format, arg_list)) < 0)
-            fprintf(stderr, "error: could not write to log: vfprintf failed with %d return value\n", rv);
-
-        if((rv = fputc('\n', output_file)) < 0)
-            fprintf(stderr, "error: could not write to log: fputc failed with %d return value\n", rv);
-
-        fflush(output_file);
-    }
-
-    va_end(arg_list);
-}
-
-// Used to print log messages related to request handling.
-void print_request_log(char *addr, char *path, char *format, uint8_t severity, FILE *output_file, int argc, ...){
-    va_list arg_list;
-    char time_buf[32];
-    int rv;
+    rv = snprintf(log_msg, LOG_HEADER_LEN, "[%s - %s] ", get_log_date(time_buf, TIME_BUF_SIZE), log_level_str[severity]);
 
     va_start(arg_list, argc);
-    get_log_date(time_buf, 32);
-
-    if(severity >= log_level){
-        if((rv = fprintf(output_file, "[%s - %s] %s on %s: ", time_buf, log_level_str[severity], addr, path)) < 0)
-            fprintf(stderr, "error: could not write to log: fprintf failed with %d return value\n", rv);
-
-        if((rv = vfprintf(output_file, format, arg_list)) < 0)
-            fprintf(stderr, "error: could not write to log: vfprintf failed with %d return value\n", rv);
-
-        if((rv = fputc('\n', output_file)) < 0)
-            fprintf(stderr, "error: could not write to log: fputc failed with %d return value\n", rv);
-
-        fflush(output_file);
-    }
-
+    vsnprintf(log_msg + rv, LOG_MSG_BUF_LEN - rv, format, arg_list);
     va_end(arg_list);
+
+    fputs(log_msg, output_file);
 }
 
 // Create a socket on PORT, get it ready for accept() and return its file descriptor or -1 on failure
@@ -241,12 +155,12 @@ int startsock(char *port, uint8_t backlog){
     struct sockaddr_in addr;
 
     if(sockfd == -1){
-        print_server_log("could not create socket: %s", LOG_ERR, stderr, 1, strerror(errno));
+        print_server_log("%s: %s", LOG_ERR, stderr, 2, "could not create socket\n", strerror(errno));
         return -1;
     }
 
     if(setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)) == -1){
-        print_server_log("setsockopt failed: %s", LOG_ERR, stderr, 1, strerror(errno));
+        print_server_log("%s: %s", LOG_ERR, stderr, 2, "setsockopt failed:\n", strerror(errno));
         close(sockfd);
         return -1;
     }
@@ -257,12 +171,12 @@ int startsock(char *port, uint8_t backlog){
     addr.sin_port = htons(atoi(port));
 
     if(bind(sockfd, (struct sockaddr*)&addr, sizeof(addr)) != 0){
-        print_server_log("could not bind to address: %s", LOG_ERR, stderr, 1, strerror(errno));
+        print_server_log("%s: %s", LOG_ERR, stderr, 2, "could not bind to address\n", strerror(errno));
         return -1;
     }
 
     if((listen(sockfd, backlog)) != 0){
-        print_server_log("could not listen on socket: %d", LOG_ERR, stderr, 1, strerror(errno));
+        print_server_log("%s: %s", LOG_ERR, stderr, 2, "could not listen on socket\n", strerror(errno));
         return -1;
     }
 
@@ -334,7 +248,7 @@ int8_t recv_request(int sockfd, char *buf, uint16_t len, uint16_t *reqline_len, 
 // Send http response through socket SOCKFD.
 // Pass 0 to BODYFD or NULL to HEADERS if you do not wish to send any data for those fields.
 // Arguments are to be passed with their ending CRLF sequences.
-// Returns 0 on success, -1 on failure to send request line, -2 on failure to send headers and -3 on failure to send body.
+// Returns 0 on success, -1 on failure
 int8_t send_response(int sockfd, char *req_line, char *headers, int bodyfd, uint16_t headers_len, size_t bodylen, uint16_t reqline_len, const char *mime_type){
     char default_headers[DEFAULT_HEADERS_LEN], time_buf[32];
     int16_t default_headers_len;
@@ -343,16 +257,16 @@ int8_t send_response(int sockfd, char *req_line, char *headers, int bodyfd, uint
         return -1;
 
     get_1123_date(time_buf, 32);
-    default_headers_len = snprintf(default_headers, 512, "Date: %s\r\nContent-Length: %ld\r\nContent-Type: %s\r\nConnection: close\r\n\r\n", time_buf, bodylen, mime_type);
+    default_headers_len = snprintf(default_headers, DEFAULT_HEADERS_LEN, "Date: %s\r\nContent-Length: %ld\r\nContent-Type: %s\r\nConnection: close\r\n\r\n", time_buf, bodylen, mime_type);
 
     if(sendall(sockfd, default_headers, default_headers_len) != 0)
-        return -2;
+        return -1;
 
     if(headers != NULL && sendall(sockfd, headers, headers_len) != 0)
-        return -2;
+        return -1;
 
     if(bodyfd != 0 && sendall_file(sockfd, bodyfd, bodylen) != 0)
-        return -3;
+        return -1;
 
     return 0;
 }
@@ -435,12 +349,16 @@ int8_t parse_request(char *req_buf, uint16_t reqline_len, uint16_t headers_len, 
             return -1;
     }
 
+
+
     if(strcmp(req_buf, "GET") == 0)
         method = GET_METHOD;
     else if(strcmp(req_buf, "HEAD") == 0)
         method = HEAD_METHOD;
     else
         return -1;
+
+
 
     char *header_end; // Used in the loop below to point to the end of the current header
     while(headers_ptr < headers_end){
@@ -469,7 +387,7 @@ void worker_cleanup(struct worker_thread_cleanup *struct_ptr){
 
 void * handle_client(void *arg){
     int file, sockfd, pagesize = *(int*)arg;
-    char *req_buf = malloc(pagesize), *path, *extension;
+    char *req_buf = malloc(pagesize), *path, *extension; // TODO malloc err handling
     char client_addr[INET_ADDRSTRLEN];
     const char *mimetype;
     int8_t rv, request_method;
@@ -489,7 +407,7 @@ void * handle_client(void *arg){
     };
 
     if((headers_table = ht_alloc(max_headers)) == NULL){
-        print_server_log("could not allocate headers table: %s", LOG_ERR, stderr, 1, strerror(errno));
+        print_server_log("could not allocate headers table: %s\n", LOG_ERR, stderr, 1, strerror(errno));
 
         worker_cleanup(&cleanup_struct);
         pthread_exit(NULL); // TODO err handling in main
@@ -498,16 +416,16 @@ void * handle_client(void *arg){
     cleanup_struct.headers_table = headers_table;
 
     while(1){
-        cleanup_struct.fds[0] = sockfd = dequeue();
+        cleanup_struct.fds[0] = sockfd = fd_dequeue(conn_queue);
 
         if(getpeername(sockfd, &addr, &addrlen) == -1){
-            print_server_log("worker could not get client addr: %s", LOG_ERR, stderr, 1, strerror(errno));
+            print_server_log("worker could not get client addr: %s\n", LOG_ERR, stderr, 1, strerror(errno));
             worker_cleanup(&cleanup_struct);
             continue;
         }
 
         inet_ntop(AF_INET, &((struct sockaddr_in *)&addr)->sin_addr, client_addr, addrlen);
-        print_server_log("handling client: %s", LOG_INFO, stdout, 1, client_addr);
+        print_server_log("handling client: %s\n", LOG_INFO, stdout, 1, client_addr);
 
         if((rv = recv_request(sockfd, req_buf, pagesize, &reqline_len, &headers_len)) == -1){
             print_server_log("recv: %s", LOG_ERR, stderr, 1, strerror(errno));
@@ -515,31 +433,32 @@ void * handle_client(void *arg){
             worker_cleanup(&cleanup_struct);
             continue;
         } else if(rv == -2){
-            print_server_log("client closed connection", LOG_ERR, stderr, 0);
+            print_server_log("client closed connection\n", LOG_ERR, stderr, 0);
 
             worker_cleanup(&cleanup_struct);
             continue;
         }
 
+
         request_method = parse_request(req_buf, reqline_len, headers_len, max_headers, headers_table);
         if(request_method < 0){
             switch(request_method){
                 case -1:
-                    print_server_log("bad request", LOG_WARN, stdout, 0);
+                    print_server_log("bad request\n", LOG_WARN, stdout, 0);
                     rv = send_error_response(sockfd, ERR_400);
                     break;
                 case -2:
-                    print_server_log("internal error", LOG_ERR, stderr, 0);
+                    print_server_log("internal error\n", LOG_ERR, stderr, 0);
                     rv = send_error_response(sockfd, ERR_500);
                     break;
                 case -3:
-                    print_server_log("invalid method %s", LOG_WARN, stdout, 1, req_buf);
+                    print_server_log("invalid method %s\n", LOG_WARN, stdout, 1, req_buf);
                     rv = send_405_response(sockfd);
                     break;
                 }
 
             if(rv < 0)
-                print_server_log("could not send error response, rv: %d", LOG_ERR, stderr, 1, rv);
+                print_server_log("could not send error response\n", LOG_ERR, stderr, 0);
 
             worker_cleanup(&cleanup_struct);
             continue;
@@ -548,12 +467,12 @@ void * handle_client(void *arg){
         path = req_buf + (request_method ? 5 : 4);
 
         if(strlen(path) > 128){
-            print_request_log(client_addr, path, "path too long", LOG_ERR, stderr, 0);
+            print_server_log("path too long", LOG_ERR, stderr, 0);
 
             if((rv = send_error_response(sockfd, ERR_400)) == -1)
-                print_request_log(client_addr, path, "could not send error response: %s", LOG_ERR, stderr, 1, strerror(errno));
+                print_server_log("could not send error response: %s\n", LOG_ERR, stderr, 1, strerror(errno));
             else if(rv == -2)
-                print_request_log(client_addr, path, "could not send error response: invalide CODEFLAG", LOG_ERR, stderr, 0);
+                print_server_log("could not send error response: invalide CODEFLAG\n", LOG_ERR, stderr, 0);
 
             worker_cleanup(&cleanup_struct);
             continue;
@@ -563,26 +482,26 @@ void * handle_client(void *arg){
             path = index_page;
 
         if((cleanup_struct.fds[1] = file = syscall(__NR_openat2, AT_FDCWD, path, &how, sizeof(how))) == -1){
-            print_request_log(client_addr, path, "could not open file: %s", LOG_ERR, stderr, 1, strerror(errno));
+            print_server_log("could not open file: %s", LOG_ERR, stderr, 1, strerror(errno));
 
             rv = errno == ENOENT ? send_error_response(sockfd, ERR_404) : send_error_response(sockfd, ERR_500);
 
             if(rv == -1)
-                print_request_log(client_addr, path, "could not send error response: %s", LOG_ERR, stderr, 1, strerror(errno));
+                print_server_log("could not send error response: %s\n", LOG_ERR, stderr, 1, strerror(errno));
             else if(rv == -2)
-                print_request_log(client_addr, path, "could not send error response: invalide CODEFLAG", LOG_ERR, stderr, 0);
+                print_server_log("could not send error response: invalide CODEFLAG\n", LOG_ERR, stderr, 0);
 
             worker_cleanup(&cleanup_struct);
             continue;
         }
 
         if(fstat(file, &stat_buf) == -1){
-            print_request_log(client_addr, path, "could not read file length: %s", LOG_ERR, stderr, 1, strerror(errno));
+            print_server_log("could not read file length: %s\n", LOG_ERR, stderr, 1, strerror(errno));
 
             if((rv = send_error_response(sockfd, ERR_500) == -1))
-                print_request_log(client_addr, path, "could not send error response: %s", LOG_ERR, stderr, 1, strerror(errno));
+                print_server_log("could not send error response: %s\n", LOG_ERR, stderr, 1, strerror(errno));
             else if(rv == -2)
-                print_request_log(client_addr, path, "could not send error response: invalid CODEFLAG", LOG_ERR, stderr, 0);
+                print_server_log("could not send error response: invalid CODEFLAG\n", LOG_ERR, stderr, 0);
 
             worker_cleanup(&cleanup_struct);
             continue;
@@ -594,16 +513,20 @@ void * handle_client(void *arg){
         if(if_modified_since != NULL){
             time_t header_timestamp = string_to_timestamp(if_modified_since->values[0]);
 
-            if(header_timestamp < 0){
-                print_request_log(client_addr, path, "could not calculate if-modified-since timestamp (%d)", LOG_ERR, stderr, 1, header_timestamp);
-
-                worker_cleanup(&cleanup_struct);
-                continue;
+            switch(header_timestamp){
+                case -1:
+                    print_server_log("could not calculate if-modified-since timestamp: pattern matching failure\n", LOG_ERR, stderr, 0);
+                    worker_cleanup(&cleanup_struct);
+                    continue;
+                case -2:
+                    print_server_log("could not calculate if-modified-since timestamp: invalid date\n", LOG_ERR, stderr, 0);
+                    worker_cleanup(&cleanup_struct);
+                    continue;
             }
 
             if(header_timestamp >= stat_buf.st_mtime){
                 if((rv = send_error_response(sockfd, ERR_304)) < 0)
-                    print_request_log(client_addr, path, "could not send error response: rv: %d, strerror: %s", LOG_ERR, stderr, 2, rv, strerror(errno));
+                    print_server_log("could not send error response: %s\n", LOG_ERR, stderr, 1, strerror(errno));
 
                 worker_cleanup(&cleanup_struct);
                 continue;
@@ -615,10 +538,8 @@ void * handle_client(void *arg){
         else
             mimetype = "application/octet-stream";
 
-        rv = send_response(sockfd, "HTTP/1.1 200 OK\r\n", NULL, request_method ? 0 : file, 0, stat_buf.st_size, 17, mimetype);
-
-        if(rv < 0)
-            print_request_log(client_addr, path, "could not send response: error %d", LOG_ERR, stderr, 1, rv);
+        if(send_response(sockfd, "HTTP/1.1 200 OK\r\n", NULL, request_method ? 0 : file, 0, stat_buf.st_size, 17, mimetype) == -1)
+            print_server_log("could not send response: %s\n", LOG_ERR, stderr, 1, strerror(errno));
 
         worker_cleanup(&cleanup_struct);
     }
@@ -634,8 +555,6 @@ int main(int argc, char ** argv){
     int16_t max_headers_input;
     pthread_t tid;
     uint8_t backlog = 20, tnum = sysconf(_SC_NPROCESSORS_ONLN);
-
-    setvbuf(stdout, NULL, _IOFBF, 0); // Needed because the log functions make multiple separate calls to printf that make the stream subject to race conditions
 
     for(int i = 1; i < argc && argv[i][0] == '-'; i+=2)
         switch(argv[i][1]){
@@ -667,7 +586,12 @@ int main(int argc, char ** argv){
         }
 
     if((listening_socket = startsock(port, backlog)) == -1){
-        print_server_log("startsock failed: %s", LOG_ERR, stderr, 1, strerror(errno));
+        print_server_log("startsock failed: %s\n", LOG_ERR, stderr, 1, strerror(errno));
+        exit(-1);
+    }
+
+    if((conn_queue = fd_queue_alloc()) == NULL){
+        print_server_log("could not allocate queue: %s\n", LOG_ERR, stderr, 1, strerror(errno));
         exit(-1);
     }
 
@@ -676,14 +600,14 @@ int main(int argc, char ** argv){
         pthread_detach(tid);
     }
 
-    print_server_log("server started on port %s\nmax. request headers: %d\nrequest buffer size: %d (same as system page size)\nnumber of threads: %d (same as number of cores)", LOG_INFO, stdout, 4, port, max_headers, pagesize, tnum);
+    print_server_log("server started on port %s\nmax. request headers: %d\nrequest buffer size: %d (same as system page size)\nnumber of threads: %d (same as number of cores)\n", LOG_INFO, stdout, 4, port, max_headers, pagesize, tnum);
 
     while(1){
         if((incoming_socket = accept(listening_socket, (struct sockaddr *)&addr, &addr_size)) == -1){
-            print_server_log("could not accept connection: %s", LOG_ERR, stderr, 1, strerror(errno));
+            print_server_log("could not accept connection: %s\n", LOG_ERR, stderr, 1, strerror(errno));
             exit(-1);
         }
 
-        enqueue(incoming_socket);
+        fd_enqueue(incoming_socket, conn_queue);
     }
 }

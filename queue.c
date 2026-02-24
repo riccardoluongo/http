@@ -8,10 +8,10 @@ fd_queue * fd_queue_alloc(){
         return NULL;
 
     new_queue->front = new_queue->rear = -1;
-    pthread_cond_init(&new_queue->not_empty, NULL);        
+    pthread_cond_init(&new_queue->not_empty, NULL);
     pthread_cond_init(&new_queue->not_full, NULL);
     pthread_mutex_init(&new_queue->mutex, NULL);
-    
+
     return new_queue;
 }
 

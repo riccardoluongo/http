@@ -1,3 +1,4 @@
+#include <stdlib.h>
 #ifdef __STDC_NO_THREADS__
     #error Multithreading support is required to compile this program!
 #endif
@@ -49,7 +50,7 @@ MimeType mime_types[N_MIME_TYPES] = {
     { ".xml", "application/xml" }
 };
 
-uint8_t max_headers = MAX_HEADERS;
+int16_t max_headers = MAX_HEADERS;
 enum log_level log_level = LOG_DEBUG;
 char *index_page = "/index.html";
 fd_queue *conn_queue;
@@ -387,7 +388,7 @@ void worker_cleanup(struct worker_thread_cleanup *struct_ptr){
 
 void * handle_client(void *arg){
     int file, sockfd, pagesize = *(int*)arg;
-    char *req_buf = malloc(pagesize), *path, *extension; // TODO malloc err handling
+    char *req_buf, *path, *extension;
     char client_addr[INET_ADDRSTRLEN];
     const char *mimetype;
     int8_t rv, request_method;
@@ -396,6 +397,12 @@ void * handle_client(void *arg){
     struct stat stat_buf;
     struct sockaddr addr;
     socklen_t addrlen = sizeof(addr);
+
+    // Grazie Anna per avermi consiglato questo messaggio di log!
+    if((req_buf = malloc(pagesize)) == NULL){
+        print_server_log("could not allocate request buffer, exiting...", LOG_ERR, stderr, 0);
+        exit(-1);
+    }
 
     struct worker_thread_cleanup cleanup_struct = {
         .fds[0] = -1,
@@ -408,9 +415,7 @@ void * handle_client(void *arg){
 
     if((headers_table = ht_alloc(max_headers)) == NULL){
         print_server_log("could not allocate headers table: %s\n", LOG_ERR, stderr, 1, strerror(errno));
-
-        worker_cleanup(&cleanup_struct);
-        pthread_exit(NULL); // TODO err handling in main
+        exit(-1);
     }
 
     cleanup_struct.headers_table = headers_table;
@@ -552,9 +557,8 @@ int main(int argc, char ** argv){
     int listening_socket, incoming_socket, pagesize = getpagesize();
     struct sockaddr_storage addr;
     socklen_t addr_size = sizeof(addr);
-    int16_t max_headers_input;
     pthread_t tid;
-    uint8_t backlog = 20, tnum = sysconf(_SC_NPROCESSORS_ONLN);
+    int16_t backlog = 64, tnum = sysconf(_SC_NPROCESSORS_ONLN);
 
     for(int i = 1; i < argc && argv[i][0] == '-'; i+=2)
         switch(argv[i][1]){
@@ -562,25 +566,29 @@ int main(int argc, char ** argv){
                 printf("simple http server written in pure C\nusage: server [options]\n\toptions:\n\t\t-p\tPort to bind to (default: 8080)\n\t\t-m\tMaximum amount of headers accepted (default: 64)\n");
                 return 0;
             case 'p':
-                if(strlen((port = argv[i+1])) > 5 || atoi(port) > 65535){
-                    fprintf(stderr, "error: invalid port number provided\n");
+                if(strtol(port = argv[i+1], NULL, 10) > 65535 || errno != 0){
+                    fprintf(stderr, "error: invalid port number provided. Enter a number between 1 and 65535\n");
                     return -1;
                 }
-                else
-                    break;
-            case 'm':
-                max_headers_input = atoi(argv[i+1]); // TODO check here too
-                max_headers = max_headers_input > 0 ? max_headers_input : MAX_HEADERS;
+
                 break;
-            case 'b':
-                if((backlog = atoi(argv[i+1])) > 254 || backlog < 1){
-                    fprintf(stderr, "invalid backlog number. Choose one between 1 and 254");
+            case 'm':
+                if((max_headers = strtol(argv[i+1], NULL, 10)) > 512 || max_headers < 1 || errno != 0){
+                    fprintf(stderr, "error: invalid max header number. Enter a number between 1 and 512\n");
                     exit(-1);
                 }
+
+                break;
+            case 'b':
+                if((backlog = strtol(argv[i+1], NULL, 10)) > 256 || backlog < 1 || errno != 0){
+                    fprintf(stderr, "invalid backlog number. Enter a number between 1 and 256");
+                    exit(-1);
+                }
+
                 break;
             case 't':
-                if((tnum = atoi(argv[i+1])) > 254 || tnum < 1){
-                    fprintf(stderr, "invalid thread count. Choose a number between 1 and 254");
+                if((tnum = strtol(argv[i+1], NULL, 10)) > 256 || tnum < 1 || errno != 0){
+                    fprintf(stderr, "invalid thread count. Enter a number between 1 and 254");
                     exit(-1);
                 }
         }

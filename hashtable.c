@@ -66,7 +66,7 @@ int compare(const void *s1, const void *s2){
     return(strcmp(s1, s2));
 }
 
-// Look for an header in the hash table and return a pointer to its value if it exists, otherwise NULL.
+// Look for an header in the hash table and return a pointer to it if it exists, otherwise NULL.
 // KEY must be all lowercase.
 Header * get_header(ht *table, char *key){
     uint16_t i, starting_index, totalsize = 0;

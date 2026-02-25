@@ -347,16 +347,12 @@ int8_t parse_request(char *req_buf, uint16_t reqline_len, uint16_t headers_len, 
             return -1;
     }
 
-
-
     if(strcmp(req_buf, "GET") == 0)
         method = GET_METHOD;
     else if(strcmp(req_buf, "HEAD") == 0)
         method = HEAD_METHOD;
     else
         return -1;
-
-
 
     char *header_end; // Used in the loop below to point to the end of the current header
     while(headers_ptr < headers_end){

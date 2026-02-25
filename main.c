@@ -1,3 +1,4 @@
+#include <stdio.h>
 #ifdef __STDC_NO_THREADS__
     #error Multithreading support is required to compile this program!
 #endif
@@ -148,7 +149,7 @@ void print_server_log(char *format, uint8_t severity, FILE *output_file, int arg
 }
 
 // Create a socket on PORT, get it ready for accept() and return its file descriptor or -1 on failure
-int startsock(char *port, uint8_t backlog){
+int startsock(uint16_t port, uint8_t backlog){
     int sockfd = socket(AF_INET, SOCK_STREAM, 0), optval = 1;
     struct sockaddr_in addr;
 
@@ -166,7 +167,7 @@ int startsock(char *port, uint8_t backlog){
     bzero(&addr, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    addr.sin_port = htons(atoi(port));
+    addr.sin_port = htons(port);
 
     if(bind(sockfd, (struct sockaddr*)&addr, sizeof(addr)) != 0){
         print_server_log("%s: %s", LOG_ERR, stderr, 2, "could not bind to address\n", strerror(errno));
@@ -547,7 +548,7 @@ void * handle_client(void *arg){
 
 int main(int argc, char ** argv){
     char *port = "8080", client_addr[INET_ADDRSTRLEN];
-    int listening_socket, incoming_socket, pagesize = getpagesize();
+    int listening_socket, incoming_socket, pagesize = getpagesize(), portnum;
     struct sockaddr_storage addr;
     socklen_t addr_size = sizeof(addr);
     pthread_t tid;
@@ -557,9 +558,9 @@ int main(int argc, char ** argv){
         switch(argv[i][1]){
             case 'h':
                 printf("simple http server written in pure C\nusage: server [options]\n\toptions:\n\t\t-p\tPort to bind to (default: 8080)\n\t\t-m\tMaximum amount of headers accepted (default: 64)\n\t\t-b\tBacklog size (default: 128)\n\t\t-t\tNumber of threads (default: number of physical threads)\n");
-                return 0;
+                exit(0);
             case 'p':
-                if(strtol(port = argv[i+1], NULL, 10) > 65535 || errno != 0){
+                if((portnum = strtol(argv[i+1], NULL, 10)) > 65535 || portnum < 1 || errno != 0){
                     fprintf(stderr, "error: invalid port number provided. Enter a number between 1 and 65535\n");
                     return -1;
                 }
@@ -574,19 +575,24 @@ int main(int argc, char ** argv){
                 break;
             case 'b':
                 if((backlog = strtol(argv[i+1], NULL, 10)) > 256 || backlog < 1 || errno != 0){
-                    fprintf(stderr, "invalid backlog number. Enter a number between 1 and 256");
+                    fprintf(stderr, "invalid backlog number. Enter a number between 1 and 256\n");
                     exit(-1);
                 }
 
                 break;
             case 't':
                 if((tnum = strtol(argv[i+1], NULL, 10)) > 256 || tnum < 1 || errno != 0){
-                    fprintf(stderr, "invalid thread count. Enter a number between 1 and 254");
+                    fprintf(stderr, "invalid thread count. Enter a number between 1 and 256\n");
                     exit(-1);
                 }
+
+                break;
+            default:
+                fprintf(stderr, "error: unrecognized argument \"%s\"\n", argv[i]);
+                exit(-1);
         }
 
-    if((listening_socket = startsock(port, backlog)) == -1){
+    if((listening_socket = startsock(portnum, backlog)) == -1){
         print_server_log("startsock failed: %s\n", LOG_ERR, stderr, 1, strerror(errno));
         exit(-1);
     }
@@ -601,7 +607,7 @@ int main(int argc, char ** argv){
         pthread_detach(tid);
     }
 
-    print_server_log("server started on port %s\nmax. request headers: %d\nrequest buffer size: %d (same as system page size)\nnumber of threads: %d (same as number of cores)\n", LOG_INFO, stdout, 4, port, max_headers, pagesize, tnum);
+    print_server_log("server started on port %d\nmax. request headers: %d\nrequest buffer size: %d (same as system page size)\nnumber of threads: %d (same as number of cores)\n", LOG_INFO, stdout, 4, portnum, max_headers, pagesize, tnum);
 
     while(1){
         if((incoming_socket = accept(listening_socket, (struct sockaddr *)&addr, &addr_size)) == -1){

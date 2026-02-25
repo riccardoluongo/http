@@ -563,7 +563,7 @@ int main(int argc, char ** argv){
     for(int i = 1; i < argc && argv[i][0] == '-'; i+=2)
         switch(argv[i][1]){
             case 'h':
-                printf("simple http server written in pure C\nusage: server [options]\n\toptions:\n\t\t-p\tPort to bind to (default: 8080)\n\t\t-m\tMaximum amount of headers accepted (default: 64)\n");
+                printf("simple http server written in pure C\nusage: server [options]\n\toptions:\n\t\t-p\tPort to bind to (default: 8080)\n\t\t-m\tMaximum amount of headers accepted (default: 64)\n\t\t-b\tBacklog size (default: 64)\n\t\t-t\tNumber of threads (default: number of physical threads)\n");
                 return 0;
             case 'p':
                 if(strtol(port = argv[i+1], NULL, 10) > 65535 || errno != 0){

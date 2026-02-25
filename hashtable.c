@@ -93,7 +93,7 @@ Header * get_header(ht *table, char *key){
 // Add header to hash table. Return 0 on success or one of the following error codes:
 //      -1: table is full
 //      -2: invalid header
-int8_t set_header(ht* table, char* headerptr){ //TODO differentiate error codes for client/server err
+int8_t set_header(ht* table, char* headerptr){
     char *val;
     uint16_t i, starting_index;
     int8_t rv;

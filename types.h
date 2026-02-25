@@ -9,7 +9,7 @@
 #define DEFAULT_HEADERS_LEN 512
 #define ERR_RESPONSE_LEN 256
 #define MAX_HEADER_VALUES 16
-#define BACKLOG 32
+#define BACKLOG 128
 #define ERR_400 0
 #define ERR_500 1
 #define ERR_404 2
@@ -29,7 +29,7 @@ enum log_level{
     LOG_ERR
 };
 
-typedef struct Header {
+typedef struct{
     char *key;
     char *values[MAX_HEADER_VALUES];
     void *next;
@@ -46,7 +46,7 @@ typedef struct{
 typedef struct {
     const char *extension;
     const char *mime_type;
-} MimeType;
+} mime_type;
 
 typedef struct {
     int fds[CONN_QUEUE_LEN];
@@ -59,16 +59,15 @@ typedef struct {
     pthread_cond_t not_empty;
 } fd_queue;
 
-struct date_enum{
+typedef struct {
     char *name;
     uint8_t num;
-};
+} date_enum;
 
 ht * ht_alloc(uint8_t max_headers);
 void ht_free(ht *table);
 Header * get_header(ht *table, char *key);
 int8_t set_header(ht* table, char* header);
-int8_t headercheck(const char *key);
 
 fd_queue * fd_queue_alloc();
 void fd_enqueue(int fd, fd_queue *queue);

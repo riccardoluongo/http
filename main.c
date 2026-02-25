@@ -1,4 +1,3 @@
-#include <stdlib.h>
 #ifdef __STDC_NO_THREADS__
     #error Multithreading support is required to compile this program!
 #endif
@@ -14,7 +13,6 @@
 #include <netinet/in.h>
 #include <netdb.h>
 #include <arpa/inet.h>
-#include <stdio.h>
 #include <sys/sendfile.h>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -23,11 +21,10 @@
 #include <sys/syscall.h>
 #include <time.h>
 #include <errno.h>
-#include <stdarg.h>
 
 #include "types.h"
 
-MimeType mime_types[N_MIME_TYPES] = {
+mime_type mime_types[N_MIME_TYPES] = {
     { ".css", "text/css" },
     { ".flac", "audio/flac" },
     { ".gif", "image/gif" },
@@ -74,11 +71,11 @@ struct worker_thread_cleanup{
 };
 
 int strcmp_bsearch_wrapper(const void *a, const void *b){
-    return strcmp(a, ((MimeType *)b)->extension);
+    return strcmp(a, ((mime_type *)b)->extension);
 }
 
 int date_enum_cmp(const void *a, const void *b){
-    return strcmp(a, ((struct date_enum *)b)->name);
+    return strcmp(a, ((date_enum *)b)->name);
 }
 
 // Store the current GMT date and time in RFC 1123 into BUF
@@ -93,7 +90,7 @@ void get_1123_date(char *buf, uint8_t bufsize){
 // Convert RFC 1123 time string into timestamp.
 // Return timestamp on success, -1 on pattern matching failure and -2 on invalid date
 time_t string_to_timestamp(char *s){
-    static const struct date_enum months[12] = {
+    static const date_enum months[12] = {
         {.name = "Apr", .num = 3},
         {.name = "Aug", .num = 7},
         {.name = "Dec", .num = 11},
@@ -110,13 +107,13 @@ time_t string_to_timestamp(char *s){
 
     char monthname[4];
     int rv;
-    const struct date_enum *bsearch_result;
+    const date_enum *bsearch_result;
     struct tm tm_struct;
 
     if((rv = sscanf(s, "%*3s, %d %3s %d %d:%d:%d %*s", &tm_struct.tm_mday, monthname, &tm_struct.tm_year, &tm_struct.tm_hour, &tm_struct.tm_min, &tm_struct.tm_sec)) < 6)
         return -1;
 
-    if((bsearch_result = bsearch(monthname, months, 12, sizeof(struct date_enum), date_enum_cmp)) == NULL)
+    if((bsearch_result = bsearch(monthname, months, 12, sizeof(date_enum), date_enum_cmp)) == NULL)
         return -2;
 
     tm_struct.tm_mon = bsearch_result->num;
@@ -513,7 +510,7 @@ void * handle_client(void *arg){
         }
 
         Header *if_modified_since = get_header(headers_table, "if-modified-since");
-        MimeType *bsearch_rv;
+        mime_type *bsearch_rv;
 
         if(if_modified_since != NULL){
             time_t header_timestamp = string_to_timestamp(if_modified_since->values[0]);
@@ -538,7 +535,7 @@ void * handle_client(void *arg){
             }
         }
 
-        if((extension = strrchr(path, '.')) != NULL && (bsearch_rv = bsearch(extension, mime_types, N_MIME_TYPES, sizeof(MimeType), strcmp_bsearch_wrapper)) != NULL)
+        if((extension = strrchr(path, '.')) != NULL && (bsearch_rv = bsearch(extension, mime_types, N_MIME_TYPES, sizeof(mime_type), strcmp_bsearch_wrapper)) != NULL)
             mimetype = bsearch_rv->mime_type;
         else
             mimetype = "application/octet-stream";
@@ -563,7 +560,7 @@ int main(int argc, char ** argv){
     for(int i = 1; i < argc && argv[i][0] == '-'; i+=2)
         switch(argv[i][1]){
             case 'h':
-                printf("simple http server written in pure C\nusage: server [options]\n\toptions:\n\t\t-p\tPort to bind to (default: 8080)\n\t\t-m\tMaximum amount of headers accepted (default: 64)\n\t\t-b\tBacklog size (default: 64)\n\t\t-t\tNumber of threads (default: number of physical threads)\n");
+                printf("simple http server written in pure C\nusage: server [options]\n\toptions:\n\t\t-p\tPort to bind to (default: 8080)\n\t\t-m\tMaximum amount of headers accepted (default: 64)\n\t\t-b\tBacklog size (default: 128)\n\t\t-t\tNumber of threads (default: number of physical threads)\n");
                 return 0;
             case 'p':
                 if(strtol(port = argv[i+1], NULL, 10) > 65535 || errno != 0){

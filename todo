@@ -1,6 +1,5 @@
 headers
 ipv6 support
-fix header files
 request struct and extensibility (maybe with function pointer)
 chunked transfer encoding
 file browser

@@ -1,1 +1,1 @@
-gcc main.c hashtable.c queue.c -g -o server
+gcc main.c state_pool.c -g -O0 -o bin/server

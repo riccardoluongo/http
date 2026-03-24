@@ -3,4 +3,4 @@ resources
 *.html
 *.tmp
 *.sync-conflict*
-*todo*
+todo

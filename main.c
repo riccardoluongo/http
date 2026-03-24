@@ -1,75 +1,8 @@
-#include <stdio.h>
-#ifdef __STDC_NO_THREADS__
-    #error Multithreading support is required to compile this program!
-#endif
-
-#include <ctype.h>
-#include <iso646.h>
-#include <linux/limits.h>
-#include <string.h>
-#include <strings.h>
-#include <sys/types.h>
+#include "main.h"
 #include <unistd.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <netdb.h>
-#include <arpa/inet.h>
-#include <sys/sendfile.h>
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <linux/openat2.h>
-#include <sys/syscall.h>
-#include <time.h>
-#include <errno.h>
 
-#include "types.h"
-
-mime_type mime_types[N_MIME_TYPES] = {
-    { ".css", "text/css" },
-    { ".flac", "audio/flac" },
-    { ".gif", "image/gif" },
-    { ".htm", "text/html" },
-    { ".html", "text/html" },
-    { ".ico", "image/x-icon" },
-    { ".jpeg", "image/jpeg" },
-    { ".jpg", "image/jpeg" },
-    { ".js", "application/javascript" },
-    { ".json", "application/json" },
-    { ".mkv", "video/x-matroska" },
-    { ".mp3", "audio/mp3" },
-    { ".mp4", "video/mp4" },
-    { ".pdf", "application/pdf" },
-    { ".png", "image/png" },
-    { ".srt", "application/x-subrip" },
-    { ".svg", "image/svg+xml" },
-    { ".txt", "text/plain" },
-    { ".vtt", "text/vtt" },
-    { ".xml", "application/xml" }
-};
-
-int16_t max_headers = MAX_HEADERS;
-enum log_level log_level = LOG_DEBUG;
-char *index_page = "/index.html";
-fd_queue *conn_queue;
-const struct open_how how = {
-    .flags = O_RDONLY,
-    .mode = 0,
-    .resolve = RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS | RESOLVE_NO_XDEV
-};
-const char *log_level_str[] = {
-    "DEBUG",
-    "INFO",
-    "WARNING",
-    "ERROR"
-};
-struct worker_thread_cleanup{
-    void *ptrs[2];
-    int fds[2];
-    ht *headers_table;
-
-    uint8_t n_ptrs, n_fds;
-};
+static uint8_t log_level = LOG_INFO;
+static char *index_page = "/index.html";
 
 int strcmp_bsearch_wrapper(const void *a, const void *b){
     return strcmp(a, ((mime_type *)b)->extension);
@@ -81,15 +14,39 @@ int date_enum_cmp(const void *a, const void *b){
 
 // Store the current GMT date and time in RFC 1123 into BUF
 void get_1123_date(char *buf, uint8_t bufsize){
-    time_t now = time(NULL);
     struct tm t;
+    time_t now = time(NULL);
 
     gmtime_r(&now, &t);
     strftime(buf, bufsize, "%a, %d %b %Y %H:%M:%S GMT", &t);
 }
 
+void print_log(char *format, uint8_t severity, FILE *output_file, ...){
+    if(severity < log_level)
+        return;
+
+    struct tm t;
+    struct timespec ts;
+    time_t now = time(NULL);
+    char log_msg[LOG_MSG_BUF_LEN], time_buf[TIME_BUF_SIZE];
+
+    localtime_r(&now, &t);
+    clock_gettime(CLOCK_REALTIME, &ts);
+    sprintf(time_buf + strftime(time_buf, TIME_BUF_SIZE, "%d/%m/%Y %H:%M:%S.", &t), "%03ld", ts.tv_nsec / 1000000);
+
+    int rv = snprintf(log_msg, LOG_HEADER_LEN, "[%s - %s] ", time_buf, log_level_str[severity]);
+
+    va_list arg_list;
+
+    va_start(arg_list, output_file);
+    vsnprintf(log_msg + rv, LOG_MSG_BUF_LEN - rv, format, arg_list);
+    va_end(arg_list);
+
+    fputs(log_msg, output_file);
+}
+
 // Convert RFC 1123 time string into timestamp.
-// Return timestamp on success, -1 on pattern matching failure and -2 on invalid date
+// Return timestamp on success or -1 on failure
 time_t string_to_timestamp(char *s){
     static const date_enum months[12] = {
         {.name = "Apr", .num = 3},
@@ -106,515 +63,547 @@ time_t string_to_timestamp(char *s){
         {.name = "Sep", .num = 8}
     };
 
-    char monthname[4];
-    int rv;
-    const date_enum *bsearch_result;
-    struct tm tm_struct;
+    struct tm header_tm_struct;
+    char monthname[4], tz[4];
 
-    if((rv = sscanf(s, "%*3s, %d %3s %d %d:%d:%d %*s", &tm_struct.tm_mday, monthname, &tm_struct.tm_year, &tm_struct.tm_hour, &tm_struct.tm_min, &tm_struct.tm_sec)) < 6)
+    // Try to parse 3 date formats
+    // This code is very ugly but for now I have better things to think about
+    if(sscanf(s, "%*3s, %d %3s %d %d:%d:%d %3s", &header_tm_struct.tm_mday, monthname, &header_tm_struct.tm_year, &header_tm_struct.tm_hour, &header_tm_struct.tm_min, &header_tm_struct.tm_sec, tz) == 7){
+        if(strcmp(tz, "GMT") != 0) return -1;
+    } else if(sscanf(s, "%*[^,], %d-%3s-%d %d:%d:%d %s", &header_tm_struct.tm_mday, monthname, &header_tm_struct.tm_year, &header_tm_struct.tm_hour, &header_tm_struct.tm_min, &header_tm_struct.tm_sec, tz) == 7){
+        if(strcmp(tz, "GMT") != 0)
+            return -1;
+
+        struct tm current_time;
+        time_t now = time(NULL);
+
+        localtime_r(&now, &current_time);
+
+        // Handle century ambiguity
+        header_tm_struct.tm_year += (header_tm_struct.tm_year + 100) - current_time.tm_year < 50 ? 2000 : 1900;
+    } else if(sscanf(s, "%*3s %3s %d %d:%d:%d %d", monthname, &header_tm_struct.tm_mday, &header_tm_struct.tm_hour, &header_tm_struct.tm_min, &header_tm_struct.tm_sec, &header_tm_struct.tm_year) == 6)
+        ;
+    else
         return -1;
 
+    const date_enum *bsearch_result;
     if((bsearch_result = bsearch(monthname, months, 12, sizeof(date_enum), date_enum_cmp)) == NULL)
-        return -2;
+        return -1;
 
-    tm_struct.tm_mon = bsearch_result->num;
-    tm_struct.tm_year -= 1900;
+    header_tm_struct.tm_mon = bsearch_result->num;
+    header_tm_struct.tm_year -= 1900;
 
-    return timegm(&tm_struct);
-}
-
-char * get_log_date(char *buf, uint8_t bufsize){
-    time_t now = time(NULL);
-    struct tm t;
-
-    localtime_r(&now, &t);
-    strftime(buf, bufsize, "%d/%m/%Y %H:%M:%S", &t);
-
-    return buf;
-}
-
-// Used to print internal log messages related to the server.
-void print_server_log(char *format, uint8_t severity, FILE *output_file, int argc, ...){
-    va_list arg_list;
-    char log_msg[LOG_MSG_BUF_LEN], time_buf[TIME_BUF_SIZE];
-    int rv;
-
-    rv = snprintf(log_msg, LOG_HEADER_LEN, "[%s - %s] ", get_log_date(time_buf, TIME_BUF_SIZE), log_level_str[severity]);
-
-    va_start(arg_list, argc);
-    vsnprintf(log_msg + rv, LOG_MSG_BUF_LEN - rv, format, arg_list);
-    va_end(arg_list);
-
-    fputs(log_msg, output_file);
+    return timegm(&header_tm_struct);
 }
 
 // Create a socket on PORT, get it ready for accept() and return its file descriptor or -1 on failure
 int startsock(uint16_t port, uint8_t backlog){
-    int sockfd = socket(AF_INET, SOCK_STREAM, 0), optval = 1;
     struct sockaddr_in addr;
+    int sockfd = socket(AF_INET, SOCK_STREAM, 0), optval = 1;
 
     if(sockfd == -1){
-        print_server_log("%s: %s", LOG_ERR, stderr, 2, "could not create socket\n", strerror(errno));
+        print_log("%s: %s", LOG_ERR, stderr, "could not create socket\n", strerror(errno));
         return -1;
     }
 
     if(setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)) == -1){
-        print_server_log("%s: %s", LOG_ERR, stderr, 2, "setsockopt failed:\n", strerror(errno));
+        print_log("%s: %s", LOG_ERR, stderr, "setsockopt failed:\n", strerror(errno));
         close(sockfd);
         return -1;
     }
 
-    bzero(&addr, sizeof(addr));
+    memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
     addr.sin_port = htons(port);
 
     if(bind(sockfd, (struct sockaddr*)&addr, sizeof(addr)) != 0){
-        print_server_log("%s: %s", LOG_ERR, stderr, 2, "could not bind to address\n", strerror(errno));
+        print_log("%s: %s", LOG_ERR, stderr, "could not bind to address\n", strerror(errno));
         return -1;
     }
 
     if((listen(sockfd, backlog)) != 0){
-        print_server_log("%s: %s", LOG_ERR, stderr, 2, "could not listen on socket\n", strerror(errno));
+        print_log("%s: %s", LOG_ERR, stderr, "could not listen on socket\n", strerror(errno));
         return -1;
     }
 
     return sockfd;
 }
 
-/*
-Loop until all LEN bytes of BUF have been sent over SOCKET.
-Returns the number of bytes left, so 0 in case of success.
-*/
-int16_t sendall(int sockfd, char *buf, uint16_t len){
-    int16_t total = 0, left = len, rv;
-
-    while(total < len){
-        if ((rv = send(sockfd, buf+total, left, 0)) == -1)
-            break;
-
-        total += rv;
-        left -= rv;
+// Set socket to non blocking mode and return 0 on success or -1 on failure
+int8_t setnonblocking(int sockfd){
+    int sock_flags;
+    if((sock_flags = fcntl(sockfd, F_GETFL, 0)) == -1){
+        print_log("could not get socket flags: %s\n", LOG_ERR, stderr, strerror(errno));
+        return -1;
     }
 
-    return left;
-}
-
-int sendall_file(int sockfd, int file, int len){
-    int total = 0, left = len, rv;
-
-    while(total < len){
-        if ((rv = sendfile(sockfd, file, NULL, len)) == -1)
-            break;
-
-        total += rv;
-        left -= rv;
+    if(fcntl(sockfd, F_SETFL, sock_flags | O_NONBLOCK) == -1){
+        print_log("could not set socket flags: %s\n", LOG_ERR, stderr, strerror(errno));
+        return -1;
     }
-
-    return left;
-}
-
-/* Read from socket SOCKFD until the request line and headers have been received or LEN bytes have been read.  REQLINE_LEN will be set to the lenght of the request line, and HEADERS_LEN will be set to the length of the headers.  Return 0 on success, -1 on error or -2 on connection closed */
-int8_t recv_request(int sockfd, char *buf, uint16_t len, uint16_t *reqline_len, uint16_t *headers_len){
-    int16_t rv = 0, written = 0;
-    char *headers_end = buf, *reqline_end = buf;
-
-    do{
-        if((rv = recv(sockfd, buf + written, len - written, 0)) == 0)
-            return -2;
-        else if(rv == -1)
-            return -1;
-
-        written += rv;
-    } while((reqline_end = memmem(buf, written, "\r\n", 2)) == NULL);
-
-    *reqline_len = reqline_end - buf;
-
-    while((headers_end = memmem(buf, written, "\r\n\r\n", 4)) == NULL){
-        if((rv = recv(sockfd, buf + written, len - written, 0)) == 0)
-            return -2;
-        else if(rv == -1)
-            return -1;
-
-        written += rv;
-    }
-
-    *headers_len = headers_end - reqline_end;
 
     return 0;
 }
 
-// Send http response through socket SOCKFD.
-// Pass 0 to BODYFD or NULL to HEADERS if you do not wish to send any data for those fields.
-// Arguments are to be passed with their ending CRLF sequences.
-// Returns 0 on success, -1 on failure
-int8_t send_response(int sockfd, char *req_line, char *headers, int bodyfd, uint16_t headers_len, size_t bodylen, uint16_t reqline_len, const char *mime_type){
-    char default_headers[DEFAULT_HEADERS_LEN], time_buf[32];
-    int16_t default_headers_len;
+// Send response to REQUEST, which is part of epoll instance EPOLLFD.
+// The STATUS_CODE argument will be ignored after the first function call (request is already sending)
+// Return 0 when done, -1 on partial write, -2 on error and -3 on invalid status code
+int8_t send_response(int epollfd, request_state *request, req_state_pool *pool, uint8_t status_code){
+    if(request->resp_header_sent == 0){ // Nothing sent yet, prepare response
+        char time_buf[TIME_BUF_SIZE];
+        get_1123_date(time_buf, TIME_BUF_SIZE);
 
-    if(sendall(sockfd, req_line, reqline_len) != 0)
-        return -1;
+        request->status_code = status_code;
 
-    get_1123_date(time_buf, 32);
-    default_headers_len = snprintf(default_headers, DEFAULT_HEADERS_LEN, "Date: %s\r\nContent-Length: %ld\r\nContent-Type: %s\r\nConnection: close\r\n\r\n", time_buf, bodylen, mime_type);
-
-    if(sendall(sockfd, default_headers, default_headers_len) != 0)
-        return -1;
-
-    if(headers != NULL && sendall(sockfd, headers, headers_len) != 0)
-        return -1;
-
-    if(bodyfd != 0 && sendall_file(sockfd, bodyfd, bodylen) != 0)
-        return -1;
-
-    return 0;
-}
-
-// Send an error response through SOCKFD depending on CODEFLAG.
-// Return 0 on success, -1 on sending error and -2 on unrecognized CODEFLAG
-int8_t send_error_response(int sockfd, uint8_t codeflag){
-    char request[ERR_RESPONSE_LEN], time_buf[32];
-    int16_t req_len;
-
-    get_1123_date(time_buf, 32);
-
-    switch(codeflag){
-        case ERR_400:
-            req_len = snprintf(request, ERR_RESPONSE_LEN, "HTTP/1.1 400 Bad Request\r\nDate: %s\r\nContent-Length: 24\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n<h1>400 Bad Request</h1>", time_buf);
-            break;
-        case ERR_500:
-            req_len = snprintf(request, ERR_RESPONSE_LEN, "HTTP/1.1 500 Internal Server Error\r\nDate: %s\r\nContent-Length: 36\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n<h1>500 Internal Server Error</h1>", time_buf);
-            break;
-        case ERR_404:
-            req_len = snprintf(request, ERR_RESPONSE_LEN, "HTTP/1.1 404 Not Found\r\nDate: %s\r\nContent-Length: 22\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n<h1>404 Not Found</h1>", time_buf);
-            break;
-        case ERR_304:
-            req_len = snprintf(request, ERR_RESPONSE_LEN, "HTTP/1.1 304 Not Modified\r\nDate: %s\r\nConnection: close\r\n\r\n", time_buf);
-            break;
-        default:
-            return -2;
-    }
-
-    return sendall(sockfd, request, req_len) != 0 ? -1 : 0;
-}
-
-// Send redirect response through SOCKFD with target TARGET_URI.
-// Return 0 on success, -1 on sending error and -2 if TARGET_URI would overflow the buffer
-int8_t send_redirect_response(int sockfd, const char *target_uri){
-    char request[ERR_RESPONSE_LEN], time_buf[32];
-    int16_t req_len;
-
-    get_1123_date(time_buf, 32);
-
-    if((req_len = snprintf(request, ERR_RESPONSE_LEN, "HTTP/1.1 301 Moved Permanently\r\nDate: %s\r\nLocation: %s\r\nConnection: close\r\n\r\n", time_buf, target_uri)) > ERR_RESPONSE_LEN)
-        return -2;
-
-    return sendall(sockfd, request, req_len) != 0 ? -1 : 0;
-}
-
-// Send method not allowed response through SOCKFD
-// Return 0 on success and -1 on failure
-int8_t send_405_response(int sockfd){
-    char request[ERR_RESPONSE_LEN], time_buf[32];
-    int16_t req_len;
-    int rv;
-
-    get_1123_date(time_buf, 32);
-    req_len = snprintf(request, ERR_RESPONSE_LEN, "HTTP/1.1 405 Method Not Allowed\r\nDate: %s\r\nAllow: GET, HEAD\r\nConnection: close\r\n\r\n", time_buf);
-
-    return sendall(sockfd, request, req_len) != 0 ? -1 : 0;
-}
-
-// Parse the http request from buffer BUF and store its headers in HEADERS.
-// The items in the request line will be turned into null terminated strings and the headers put into a hash table (which will first need to be allocated with ht_alloc); the body will remain unchanged.
-// Return a number corresponding to the request's method on success or a negative value in case of error.
-// Error codes:
-//      -1: bad request
-//      -2: internal error
-//      -3: invalid method
-int8_t parse_request(char *req_buf, uint16_t reqline_len, uint16_t headers_len, uint8_t max_headers, ht *headers_table){
-    char *headers_ptr = req_buf + reqline_len + 2;
-    const char *headers_end = headers_ptr + headers_len;
-    int8_t method;
-
-    // Replace the spaces in the request line to make us able to treat every piece as a string
-    for(char i = 0, *separator = req_buf; i < 2; i++){ // Declaring i as char to be able to also declare the separator pointer here
-        if((separator = memchr(separator, ' ', reqline_len - (separator - req_buf))) == NULL)
-            return -1;
-
-        *separator++ = '\0';
-
-        if(isspace(*separator)) // Too many spaces
-            return -1;
-    }
-
-    if(strcmp(req_buf, "GET") == 0)
-        method = GET_METHOD;
-    else if(strcmp(req_buf, "HEAD") == 0)
-        method = HEAD_METHOD;
-    else
-        return -1;
-
-    char *header_end; // Used in the loop below to point to the end of the current header
-    while(headers_ptr < headers_end){
-        if((header_end = memmem(headers_ptr, headers_end - headers_ptr, "\r\n", 2)) == NULL)
-            return -1;
-        *header_end = '\0';
-
-        if(set_header(headers_table, headers_ptr) < 0)
-            return -1;
-
-        headers_ptr = header_end + 2;
-    }
-
-    return method;
-}
-
-void worker_cleanup(struct worker_thread_cleanup *struct_ptr){
-    for(uint8_t i = 0; i < struct_ptr->n_ptrs; i++)
-        free(struct_ptr->ptrs[i]);
-
-    for(uint8_t i = 0; i < struct_ptr->n_fds; i++)
-        if(struct_ptr->fds[i] != -1) close(struct_ptr->fds[i]);
-
-    memset(struct_ptr->headers_table->arr, 0, struct_ptr->headers_table->capacity * sizeof(Header));
-}
-
-void * handle_client(void *arg){
-    int file, sockfd, pagesize = *(int*)arg;
-    char *req_buf, *path, *extension;
-    char client_addr[INET_ADDRSTRLEN];
-    const char *mimetype;
-    int8_t rv, request_method;
-    uint16_t reqline_len = 0, headers_len = 0;
-    ht *headers_table;
-    struct stat stat_buf;
-    struct sockaddr addr;
-    socklen_t addrlen = sizeof(addr);
-
-    // Grazie Anna per avermi consiglato questo messaggio di log!
-    if((req_buf = malloc(pagesize)) == NULL){
-        print_server_log("could not allocate request buffer, exiting...", LOG_ERR, stderr, 0);
-        exit(-1);
-    }
-
-    struct worker_thread_cleanup cleanup_struct = {
-        .fds[0] = -1,
-        .fds[1] = -1,
-        .headers_table = NULL,
-
-        .n_ptrs = 0,
-        .n_fds = 2
-    };
-
-    if((headers_table = ht_alloc(max_headers)) == NULL){
-        print_server_log("could not allocate headers table: %s\n", LOG_ERR, stderr, 1, strerror(errno));
-        exit(-1);
-    }
-
-    cleanup_struct.headers_table = headers_table;
-
-    while(1){
-        cleanup_struct.fds[0] = sockfd = fd_dequeue(conn_queue);
-
-        if(getpeername(sockfd, &addr, &addrlen) == -1){
-            print_server_log("worker could not get client addr: %s\n", LOG_ERR, stderr, 1, strerror(errno));
-            worker_cleanup(&cleanup_struct);
-            continue;
+        switch(request->status_code){
+            case ERR_400:
+                request->resp_header_len = snprintf(request->response_header, RESPONSE_BUF_LEN, "HTTP/1.1 400 Bad Request\r\nDate: %s\r\nContent-Length: 24\r\nContent-Type: text/html%s\r\n\r\n<h1>400 Bad Request</h1>", time_buf, request->close_conn ? "\r\nConnection: close" : "");
+                break;
+            case ERR_500:
+                request->resp_header_len = snprintf(request->response_header, RESPONSE_BUF_LEN, "HTTP/1.1 500 Internal Server Error\r\nDate: %s\r\nContent-Length: 34\r\nContent-Type: text/html%s\r\n\r\n<h1>500 Internal Server Error</h1>", time_buf, request->close_conn ? "\r\nConnection: close" : "");
+                break;
+            case ERR_404:
+                request->resp_header_len = snprintf(request->response_header, RESPONSE_BUF_LEN, "HTTP/1.1 404 Not Found\r\nDate: %s\r\nContent-Length: 22\r\nContent-Type: text/html%s\r\n\r\n<h1>404 Not Found</h1>", time_buf, request->close_conn ? "\r\nConnection: close" : "");
+                break;
+            case ERR_405:
+                request->resp_header_len  = snprintf(request->response_header, RESPONSE_BUF_LEN, "HTTP/1.1 405 Method Not Allowed\r\nDate: %s\r\nAllow: GET, HEAD%s\r\n\r\n", time_buf, request->close_conn ? "\r\nConnection: close" : "");
+                break;
+            case ERR_414:
+                request->resp_header_len  = snprintf(request->response_header, RESPONSE_BUF_LEN, "HTTP/1.1 414 URI Too Long\r\nDate: %s\r\nContent-Length: 25\r\nContent-Type: text/html%s\r\n\r\n<h1>414 URI Too Long</h1>", time_buf, request->close_conn ? "\r\nConnection: close" : "");
+                break;
+            case ERR_304:
+                request->resp_header_len = snprintf(request->response_header, RESPONSE_BUF_LEN, "HTTP/1.1 304 Not Modified\r\nDate: %s%s\r\n\r\n", time_buf, request->close_conn ? "\r\nConnection: close" : "");
+                break;
+            case OK:
+                request->resp_header_len = snprintf(request->response_header, RESPONSE_BUF_LEN, "HTTP/1.1 200 OK\r\nDate: %s\r\nContent-Length: %ld\r\nContent-Type: %s%s\r\n\r\n", time_buf, request->fsize, request->mimetype, request->close_conn ? "\r\nConnection: close" : "");
+                break;
+            default:
+                return -3;
         }
 
-        inet_ntop(AF_INET, &((struct sockaddr_in *)&addr)->sin_addr, client_addr, addrlen);
-        print_server_log("handling client: %s\n", LOG_INFO, stdout, 1, client_addr);
+        if(request->status_code != 0)
+            request->file = -1;
+        request->stage = WRITE;
+    }
 
-        if((rv = recv_request(sockfd, req_buf, pagesize, &reqline_len, &headers_len)) == -1){
-            print_server_log("recv: %s", LOG_ERR, stderr, 1, strerror(errno));
+    struct epoll_event write_ev = {epoll_write_flags, request}; // Used to rearm sockets for writes
+    struct epoll_event read_ev = {epoll_read_flags, request}; // Used to rearm sockets for reads
+    ssize_t sent;
 
-            worker_cleanup(&cleanup_struct);
-            continue;
-        } else if(rv == -2){
-            print_server_log("client closed connection\n", LOG_ERR, stderr, 0);
-
-            worker_cleanup(&cleanup_struct);
-            continue;
-        }
-
-
-        request_method = parse_request(req_buf, reqline_len, headers_len, max_headers, headers_table);
-        if(request_method < 0){
-            switch(request_method){
-                case -1:
-                    print_server_log("bad request\n", LOG_WARN, stdout, 0);
-                    rv = send_error_response(sockfd, ERR_400);
-                    break;
-                case -2:
-                    print_server_log("internal error\n", LOG_ERR, stderr, 0);
-                    rv = send_error_response(sockfd, ERR_500);
-                    break;
-                case -3:
-                    print_server_log("invalid method %s\n", LOG_WARN, stdout, 1, req_buf);
-                    rv = send_405_response(sockfd);
-                    break;
+    if(request->resp_header_sent < request->resp_header_len){
+        if((sent = send(request->connfd, request->response_header, request->resp_header_len - request->resp_header_sent, request->file > 0 ? MSG_MORE : 0)) == -1){
+            if(errno == EAGAIN || errno == EWOULDBLOCK){
+                if(epoll_ctl(epollfd, EPOLL_CTL_MOD, request->connfd, &write_ev) == -1){
+                    print_log("could not rearm socket: %s\n", LOG_ERR, stderr, strerror(errno));
+                    return -2;
                 }
 
-            if(rv < 0)
-                print_server_log("could not send error response\n", LOG_ERR, stderr, 0);
-
-            worker_cleanup(&cleanup_struct);
-            continue;
+                return -1;
+            } else{
+                print_log("could not send response header: %s\n", LOG_ERR, stderr, strerror(errno));
+                return -2;
+            }
+        } else if(sent == 0){
+            req_state_pool_release(pool, request);
+            return -2;
         }
 
-        path = req_buf + (request_method ? 5 : 4);
+        request->resp_header_sent += sent;
 
-        if(strlen(path) > 128){
-            print_server_log("path too long", LOG_ERR, stderr, 0);
-
-            if((rv = send_error_response(sockfd, ERR_400)) == -1)
-                print_server_log("could not send error response: %s\n", LOG_ERR, stderr, 1, strerror(errno));
-            else if(rv == -2)
-                print_server_log("could not send error response: invalide CODEFLAG\n", LOG_ERR, stderr, 0);
-
-            worker_cleanup(&cleanup_struct);
-            continue;
-        }
-
-        if(path[0] == '/' && path[1] == '\0')
-            path = index_page;
-
-        if((cleanup_struct.fds[1] = file = syscall(__NR_openat2, AT_FDCWD, path, &how, sizeof(how))) == -1){
-            print_server_log("could not open file: %s", LOG_ERR, stderr, 1, strerror(errno));
-
-            rv = errno == ENOENT ? send_error_response(sockfd, ERR_404) : send_error_response(sockfd, ERR_500);
-
-            if(rv == -1)
-                print_server_log("could not send error response: %s\n", LOG_ERR, stderr, 1, strerror(errno));
-            else if(rv == -2)
-                print_server_log("could not send error response: invalide CODEFLAG\n", LOG_ERR, stderr, 0);
-
-            worker_cleanup(&cleanup_struct);
-            continue;
-        }
-
-        if(fstat(file, &stat_buf) == -1){
-            print_server_log("could not read file length: %s\n", LOG_ERR, stderr, 1, strerror(errno));
-
-            if((rv = send_error_response(sockfd, ERR_500) == -1))
-                print_server_log("could not send error response: %s\n", LOG_ERR, stderr, 1, strerror(errno));
-            else if(rv == -2)
-                print_server_log("could not send error response: invalid CODEFLAG\n", LOG_ERR, stderr, 0);
-
-            worker_cleanup(&cleanup_struct);
-            continue;
-        }
-
-        Header *if_modified_since = get_header(headers_table, "if-modified-since");
-        mime_type *bsearch_rv;
-
-        if(if_modified_since != NULL){
-            time_t header_timestamp = string_to_timestamp(if_modified_since->values[0]);
-
-            switch(header_timestamp){
-                case -1:
-                    print_server_log("could not calculate if-modified-since timestamp: pattern matching failure\n", LOG_ERR, stderr, 0);
-                    worker_cleanup(&cleanup_struct);
-                    continue;
-                case -2:
-                    print_server_log("could not calculate if-modified-since timestamp: invalid date\n", LOG_ERR, stderr, 0);
-                    worker_cleanup(&cleanup_struct);
-                    continue;
+        if(request->resp_header_sent < request->resp_header_len){
+            if(epoll_ctl(epollfd, EPOLL_CTL_MOD, request->connfd, &write_ev) == -1){
+                print_log("could not rearm socket: %s\n", LOG_ERR, stderr, strerror(errno));
+                return -2;
             }
 
-            if(header_timestamp >= stat_buf.st_mtime){
-                if((rv = send_error_response(sockfd, ERR_304)) < 0)
-                    print_server_log("could not send error response: %s\n", LOG_ERR, stderr, 1, strerror(errno));
+            return -1;
+        }
+    }
 
-                worker_cleanup(&cleanup_struct);
+    if(request->file > 0){ // If the response has a body, send it
+        if((sent = sendfile(request->connfd, request->file, &request->fsent, request->fsize - request->fsent)) == -1){
+            if(errno == EAGAIN || errno == EWOULDBLOCK){
+                if(epoll_ctl(epollfd, EPOLL_CTL_MOD, request->connfd, &write_ev) == -1){
+                    print_log("could not rearm socket: %s\n", LOG_ERR, stderr, strerror(errno));
+                    return -2;
+                }
+
+                return -1;
+            } else{
+                print_log("could not send response body: %s\n", LOG_ERR, stderr, strerror(errno));
+                return -2;
+            }
+        } else if(sent == 0){
+            req_state_pool_release(pool, request);
+            return -2;
+        }
+
+        if(request->fsent < request->fsize){
+            if(epoll_ctl(epollfd, EPOLL_CTL_MOD, request->connfd, &write_ev) == -1){
+                print_log("could not rearm socket: %s\n", LOG_ERR, stderr, strerror(errno));
+                return -2;
+            }
+
+            return -1;
+        } else {
+            close(request->file);
+        }
+    }
+
+    // Reset request state
+    request->buf_written = request->fsent = request->resp_header_sent = 0;
+    request->file = -1;
+    request->stage = READ;
+
+    if(!request->close_conn){
+        if(epoll_ctl(epollfd, EPOLL_CTL_MOD, request->connfd, &read_ev) == -1){
+            print_log("could not rearm socket: %s\n", LOG_ERR, stderr, strerror(errno));
+            return -2;
+        }
+    } else{
+        close(request->connfd);
+    }
+
+    return 0;
+}
+
+// Main server logic executed by workers
+void * handle_client(void *arg){
+    thread_args * args = (thread_args *)arg; // Thread arguments struct passed via ARG
+    int16_t rv; // Used to temporarily store return values when needed
+    struct epoll_event ev = {.events = epoll_read_flags}; // Default epoll event struct
+
+    while(1){
+        int16_t fds_n;
+
+        if((fds_n = epoll_wait(args->epollfd, args->events, MAX_EVENTS, -1)) == -1){
+            print_log("epoll_wait failed: %s\n", LOG_ERR, stderr, strerror(errno));
+
+            if(errno == EINTR)
                 continue;
-            }
+            exit(-1);
         }
 
-        if((extension = strrchr(path, '.')) != NULL && (bsearch_rv = bsearch(extension, mime_types, N_MIME_TYPES, sizeof(mime_type), strcmp_bsearch_wrapper)) != NULL)
-            mimetype = bsearch_rv->mime_type;
-        else
-            mimetype = "application/octet-stream";
+        for(uint16_t i = 0; i < fds_n; i++){
+            request_state *req_state = (request_state *)args->events[i].data.ptr;
 
-        if(send_response(sockfd, "HTTP/1.1 200 OK\r\n", NULL, request_method ? 0 : file, 0, stat_buf.st_size, 17, mimetype) == -1)
-            print_server_log("could not send response: %s\n", LOG_ERR, stderr, 1, strerror(errno));
+            if(req_state->connfd == args->listenfd){ // New connection
+                struct sockaddr addr;
+                socklen_t addrlen = sizeof(addr);
 
-        worker_cleanup(&cleanup_struct);
+                while(1){
+                    // Accept connection
+                    int sockfd;
+                    if((sockfd = accept(req_state->connfd, &addr, &addrlen)) == -1){
+                        if(errno == EAGAIN || errno == EWOULDBLOCK)
+                            break;
+
+                        print_log("could not accept connection: %s\n", LOG_ERR, stderr, strerror(errno));
+                        continue;
+                    }
+
+                    // Make socket nonblocking
+                    if(setnonblocking(sockfd) == -1)
+                        continue;
+
+                    // Add socket to interest list
+                    ev.data.ptr = req_state_pool_acquire(args->pool);
+                    ((request_state *)ev.data.ptr)->connfd = sockfd;
+                    if(epoll_ctl(args->epollfd, EPOLL_CTL_ADD, sockfd, &ev) == -1){
+                        print_log("could not add socket to interest list: %s\n", LOG_ERR, stderr, strerror(errno));
+                        continue;
+                    }
+
+                    // Get client addr and print it
+                    if(getpeername(sockfd, &addr, &addrlen) == -1){
+                        print_log("could not get client addr: %s\n", LOG_ERR, stderr, strerror(errno));
+                        continue;
+                    }
+
+                    char client_addr[INET_ADDRSTRLEN];
+                    inet_ntop(AF_INET, &((struct sockaddr_in *)&addr)->sin_addr, client_addr, addrlen);
+                    print_log("got connection from: %s\n", LOG_INFO, stdout, client_addr);
+                }
+           } else { // Handle request
+                if(req_state->stage == READ){
+                    uint16_t buffer_avail = REQ_BUF_SIZE - req_state->buf_written; // Number of free bytes left in the buffer
+
+                    if(buffer_avail == 0){ // Buffer is full, send error response
+                        send_response(args->epollfd, req_state, args->pool, ERR_400);
+                        continue;
+                    }
+
+                    // Receive request
+                    if((rv = recv(req_state->connfd, req_state->buf, buffer_avail, 0)) == -1){
+                        if(errno == EAGAIN || errno == EWOULDBLOCK){
+                            // Rearm socket
+                            ev.data.ptr = req_state;
+                            if(epoll_ctl(args->epollfd, EPOLL_CTL_MOD, req_state->connfd, &ev) == -1)
+                                print_log("could not rearm socket: %s\n", LOG_ERR, stderr, strerror(errno));
+                        } else{
+                            print_log("could not recv from socket: %s\n", LOG_ERR, stderr, strerror(errno));
+                            req_state_pool_release(args->pool, req_state);
+                        }
+
+                        continue;
+                    } else if(rv == 0){
+                        req_state_pool_release(args->pool, req_state);
+                        continue;
+                    }
+
+                    // Find end of request and NULL terminate it
+                    char *end;
+                    if((end = memmem(req_state->buf + req_state->buf_written, rv, "\r\n\r\n", 4)) == NULL)
+                        continue;
+                    *end = '\0';
+
+                    req_state->buf_written += rv;
+
+                    // Split request line for parsing
+                    char *save_ptr, *path;
+                    if((req_state->method_str = strtok_r(req_state->buf, " ", &save_ptr)) == NULL || (path = strtok_r(NULL, " ", &save_ptr)) == NULL || (req_state->version_str = strtok_r(NULL, "\r\n", &save_ptr)) == NULL){
+                        print_log("malformed request line\n", LOG_ERR, stderr);
+                        send_response(args->epollfd, req_state, args->pool, ERR_400);
+                        continue;
+                    }
+
+                    // Detect method
+                    uint8_t method;
+                    if(strcmp(req_state->buf, "GET") == 0)
+                        method = GET;
+                    else if(strcmp(req_state->buf, "HEAD") == 0)
+                        method = HEAD;
+                    else{
+                        send_response(args->epollfd, req_state, args->pool, ERR_405);
+                        continue;
+                    }
+
+                    // Detect protocol version
+                    uint8_t ver;
+                    if(strcmp(req_state->version_str, "HTTP/1.1") == 0)
+                        ver = HTTP_1_1;
+                    else if(strcmp(req_state->version_str, "HTTP/1.0") == 0){
+                        req_state->close_conn = 1;
+                        ver = HTTP_1_0;
+                    } else{
+                        send_response(args->epollfd, req_state, args->pool, ERR_400);
+                    }
+
+                    const char *headers = req_state->version_str + 10;
+
+                    char *host_header;
+                    if(ver == HTTP_1_1 && (host_header = strcasestr(headers, "host:")) == NULL){
+                        send_response(args->epollfd, req_state, args->pool, ERR_400);
+                        continue;
+                    }
+
+                    if(path[0] != '/'){ // Might be absolute form URI
+                        host_header += 5; // Go to value
+                        while(isblank(*host_header)) host_header++; // Skip whitespace
+
+                        char *host;
+                        if(strncasecmp(path, "http://", 7) != 0 || (path = strchr((host = path + 7), '/')) == NULL || strncasecmp(host, host_header, path - host) != 0){
+                            send_response(args->epollfd, req_state, args->pool, ERR_400);
+                            continue;
+                        }
+                    }
+
+                    // Check path len
+                    if(strlen(path) > MAX_PATH_LEN){
+                        send_response(args->epollfd, req_state, args->pool, ERR_414);
+                        continue;
+                    }
+
+                    // If path is empty, set it to index page
+                    if(path[0] == '/' && path[1] == '\0')
+                        path = index_page;
+
+                    // Open file to serve
+                    static const struct open_how how = {
+                        .flags = O_RDONLY,
+                        .mode = 0,
+                        .resolve = RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS | RESOLVE_NO_XDEV
+                    };
+                    if((req_state->file = syscall(__NR_openat2, AT_FDCWD, path, &how, sizeof(how))) == -1){
+                        print_log("could not open file: %s\n", LOG_ERR, stderr, strerror(errno));
+                        send_response(args->epollfd, req_state, args->pool, errno == ENOENT ? ERR_404 : ERR_500);
+                        continue;
+                    }
+
+                    // Stat used to get file size and modification date
+                    struct stat stat_buf;
+                    if(fstat(req_state->file, &stat_buf) == -1){
+                        print_log("could not read file length: %s\n", LOG_ERR, stderr, strerror(errno));
+                        send_response(args->epollfd, req_state, args->pool, ERR_500);
+                        continue;
+                    }
+
+                    // Check header values
+                    char *if_modified_since;
+                    if((if_modified_since = strcasestr(headers, "If-Modified-Since:")) != NULL){
+                        if_modified_since += 18; // Go to value
+                        while(isblank(*if_modified_since)) if_modified_since++; // Skip whitespace
+
+                        time_t header_timestamp;
+                        if((header_timestamp = string_to_timestamp(if_modified_since)) < 0){
+                            send_response(args->epollfd, req_state, args->pool, ERR_400);
+                            continue;
+                        }
+
+                        if(header_timestamp >= stat_buf.st_mtime){
+                            send_response(args->epollfd, req_state, args->pool, ERR_304);
+                            continue;
+                        }
+                    }
+
+                    char *connection_header;
+                    if((connection_header = strcasestr(headers, "connection:")) != NULL){
+                        connection_header += 11; // Go to header value
+                        while(isblank(*connection_header)) connection_header++; // Skip trailing whitespace
+
+                        if(ver == HTTP_1_1 && strcasecmp(connection_header, "close") == 0)
+                            req_state->close_conn = 1;
+                        else if(ver == HTTP_1_0)
+                            if(strcasecmp(connection_header, "keep-alive") == 0) req_state->close_conn = 0;
+                    }
+
+                    // Determine body mime type
+                    mime_type *bsearch_rv;
+                    const char *extension;
+
+                    if((extension = strrchr(path, '.')) != NULL && (bsearch_rv = bsearch(extension, mime_types, N_MIME_TYPES, sizeof(mime_type), strcmp_bsearch_wrapper)) != NULL)
+                        req_state->mimetype = bsearch_rv->mime_type;
+                    else
+                        req_state->mimetype = "application/octet-stream";
+
+                    // Determine wether to send body
+                    if(method == HEAD)
+                        req_state->file = -1;
+                    else
+                        req_state->fsize = stat_buf.st_size;
+                    // Send response
+                    send_response(args->epollfd, req_state, args->pool, OK);
+                } else if(req_state->stage == WRITE){
+                    // Response is not done sending, continue
+                    send_response(args->epollfd, req_state, args->pool, OK);
+                }
+            }
+        }
     }
 
     pthread_exit(NULL);
 }
 
 int main(int argc, char ** argv){
-    char *port = "8080", client_addr[INET_ADDRSTRLEN];
-    int listening_socket, incoming_socket, pagesize = getpagesize(), portnum;
-    struct sockaddr_storage addr;
-    socklen_t addr_size = sizeof(addr);
-    pthread_t tid;
-    int16_t backlog = 64, tnum = sysconf(_SC_NPROCESSORS_ONLN);
+    int portnum = 8080;
+    int16_t backlog = BACKLOG, tnum = sysconf(_SC_NPROCESSORS_ONLN);
 
-    for(int i = 1; i < argc && argv[i][0] == '-'; i+=2)
-        switch(argv[i][1]){
-            case 'h':
-                printf("simple http server written in pure C\nusage: server [options]\n\toptions:\n\t\t-p\tPort to bind to (default: 8080)\n\t\t-m\tMaximum amount of headers accepted (default: 64)\n\t\t-b\tBacklog size (default: 128)\n\t\t-t\tNumber of threads (default: number of physical threads)\n");
-                exit(0);
-            case 'p':
-                if((portnum = strtol(argv[i+1], NULL, 10)) > 65535 || portnum < 1 || errno != 0){
-                    fprintf(stderr, "error: invalid port number provided. Enter a number between 1 and 65535\n");
-                    return -1;
-                }
+    // Parse CLI args
+    for(int i = 1; i < argc; i+=2){
+        if(argv[i][0] == '-')
+            switch(argv[i][1]){
+                case 'h':
+                    printf("simple http server written in pure C\nusage: server [options]\n\toptions:\n\t\t-p\tPort to bind to (default: 8080)\n\t\t-m\tMaximum amount of headers accepted (default: 64)\n\t\t-b\tBacklog size (default: 128)\n\t\t-t\tNumber of threads (default: number of physical threads)\n");
+                    exit(0);
+                case 'p':
+                    if((portnum = strtol(argv[i+1], NULL, 10)) > 65535 || portnum < 1 || errno != 0){
+                        fprintf(stderr, "error: invalid port number provided. Enter a number between 1 and 65535\n");
+                        return -1;
+                    }
 
-                break;
-            case 'm':
-                if((max_headers = strtol(argv[i+1], NULL, 10)) > 512 || max_headers < 1 || errno != 0){
-                    fprintf(stderr, "error: invalid max header number. Enter a number between 1 and 512\n");
-                    exit(-1);
-                }
+                    continue;
+                case 'b':
+                    if((backlog = strtol(argv[i+1], NULL, 10)) > 256 || backlog < 1 || errno != 0){
+                        fprintf(stderr, "invalid backlog number. Enter a number between 1 and 256\n");
+                        exit(-1);
+                    }
 
-                break;
-            case 'b':
-                if((backlog = strtol(argv[i+1], NULL, 10)) > 256 || backlog < 1 || errno != 0){
-                    fprintf(stderr, "invalid backlog number. Enter a number between 1 and 256\n");
-                    exit(-1);
-                }
+                    continue;
+                case 't':
+                    if((tnum = strtol(argv[i+1], NULL, 10)) > 256 || tnum < 1 || errno != 0){
+                        fprintf(stderr, "invalid thread count. Enter a number between 1 and 256\n");
+                        exit(-1);
+                    }
 
-                break;
-            case 't':
-                if((tnum = strtol(argv[i+1], NULL, 10)) > 256 || tnum < 1 || errno != 0){
-                    fprintf(stderr, "invalid thread count. Enter a number between 1 and 256\n");
-                    exit(-1);
-                }
+                    continue;
+                case 'l':
+                    if(strcmp(argv[i+1], "debug") == 0)
+                        log_level = LOG_DEBUG;
+                    else if(strcmp(argv[i+1], "info") == 0)
+                        log_level = LOG_INFO;
+                    else if(strcmp(argv[i+1], "warning") == 0)
+                        log_level = LOG_WARN;
+                    else if(strcmp(argv[i+1], "error") == 0)
+                        log_level = LOG_ERR;
+                    else
+                        fprintf(stderr, "invalid log level provided. Try -h for help\n");
 
-                break;
-            default:
-                fprintf(stderr, "error: unrecognized argument \"%s\"\n", argv[i]);
-                exit(-1);
-        }
+                    continue;
+            }
 
+        fprintf(stderr, "error: unrecognized argument \"%s\"\n", argv[i]);
+        exit(-1);
+    }
+
+    // Allocate epoll event buffer
+    struct epoll_event *events_buf;
+    if((events_buf = malloc(MAX_EVENTS * sizeof(struct epoll_event))) == NULL){
+        print_log("could not allocate epoll event buffer: %s\n", LOG_ERR, stderr, strerror(errno));
+        exit(-1);
+    }
+
+    // Create epoll instance
+    int epollfd;
+    if((epollfd = epoll_create1(0)) == -1){
+        print_log("could not create epoll fd: %s\n", LOG_ERR, stderr, strerror(errno));
+        exit(-1);
+    }
+
+    // Start listening socket
+    int listening_socket;
     if((listening_socket = startsock(portnum, backlog)) == -1){
-        print_server_log("startsock failed: %s\n", LOG_ERR, stderr, 1, strerror(errno));
+        print_log("could not create listening socket: %s\n", LOG_ERR, stderr, strerror(errno));
         exit(-1);
     }
 
-    if((conn_queue = fd_queue_alloc()) == NULL){
-        print_server_log("could not allocate queue: %s\n", LOG_ERR, stderr, 1, strerror(errno));
+    // Set listening socket to nonblocking
+    if(setnonblocking(listening_socket) == -1)
+        exit(-1);
+
+    // Add listening socket to interest list
+    // Wasting 4kb of memory here because ev.data.ptr is an union and we need it to be consistent
+    struct epoll_event ev;
+    if((ev.data.ptr = malloc(sizeof(request_state))) == NULL){
+        print_log("could not allocate request_state struct for listening socket: %s\n", LOG_ERR, stderr, strerror(errno));
+        exit(-1);
+    }
+    (*(request_state *)ev.data.ptr).connfd = listening_socket;
+    ev.events = EPOLLIN | EPOLLET;
+
+    if(epoll_ctl(epollfd, EPOLL_CTL_ADD, listening_socket, &ev) == -1){
+        print_log("could not add listening socket to interest list: %s\n", LOG_ERR, stderr, strerror(errno));
         exit(-1);
     }
 
-    for(uint8_t i = 0; i < tnum; i++){
-        pthread_create(&tid, NULL, handle_client, &pagesize);
+    // Start worker threads
+
+    thread_args args = {.epollfd = epollfd, .listenfd = listening_socket, .events = events_buf};
+
+    // Allocate memory pool for request state
+    if((args.pool = req_state_pool_alloc(MAX_EVENTS)) == NULL){
+        print_log("could not allocate request state memory pool: %s\n", LOG_ERR, stderr, strerror(errno));
+        exit(-1);
+    }
+
+    for(uint8_t i = 1; i < tnum; i++){ // Core number - 1 because main thread becomes worker
+        pthread_t tid;
+        pthread_create(&tid, NULL, handle_client, &args);
         pthread_detach(tid);
     }
 
-    print_server_log("server started on port %d\nmax. request headers: %d\nrequest buffer size: %d (same as system page size)\nnumber of threads: %d (same as number of cores)\n", LOG_INFO, stdout, 4, portnum, max_headers, pagesize, tnum);
+    print_log("server started on port %d, number of threads: %d, log level: %s\n", LOG_INFO, stdout, portnum, tnum, log_level_str[log_level]);
 
-    while(1){
-        if((incoming_socket = accept(listening_socket, (struct sockaddr *)&addr, &addr_size)) == -1){
-            print_server_log("could not accept connection: %s\n", LOG_ERR, stderr, 1, strerror(errno));
-            exit(-1);
-        }
-
-        fd_enqueue(incoming_socket, conn_queue);
-    }
+    // Turn main thread into worker
+    handle_client(&args);
 }

@@ -1,8 +1,10 @@
-headers
 ipv6 support
-request struct and extensibility (maybe with function pointer)
-chunked transfer encoding
 file browser
-keep conn alive
-nonblocking sockets
-start logging inside functions, who gives a shit
+logging inside functions
+fatal log level that exits from program
+maybe separate functions for different protocol versions
+support for CGI scripts (finally handle extensibility!)
+handle EINTR
+
+http/1.1 compliance:
+    range support

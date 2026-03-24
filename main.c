@@ -192,7 +192,11 @@ int8_t send_response(int epollfd, request_state *request, req_state_pool *pool, 
     ssize_t sent;
 
     if(request->resp_header_sent < request->resp_header_len){
-        if((sent = send(request->connfd, request->response_header, request->resp_header_len - request->resp_header_sent, request->file > 0 ? MSG_MORE : 0)) == -1){
+        do
+            sent = send(request->connfd, request->response_header, request->resp_header_len - request->resp_header_sent, request->file > 0 ? MSG_MORE : 0);
+        while(sent == -1 && errno == EINTR);
+
+        if(sent == -1){
             if(errno == EAGAIN || errno == EWOULDBLOCK){
                 if(epoll_ctl(epollfd, EPOLL_CTL_MOD, request->connfd, &write_ev) == -1){
                     print_log("could not rearm socket: %s\n", LOG_ERR, stderr, strerror(errno));
@@ -222,7 +226,11 @@ int8_t send_response(int epollfd, request_state *request, req_state_pool *pool, 
     }
 
     if(request->file > 0){ // If the response has a body, send it
-        if((sent = sendfile(request->connfd, request->file, &request->fsent, request->fsize - request->fsent)) == -1){
+        do
+            sent = sendfile(request->connfd, request->file, &request->fsent, request->fsize - request->fsent);
+        while(sent == -1 && errno == EINTR);
+
+        if(sent == -1){
             if(errno == EAGAIN || errno == EWOULDBLOCK){
                 if(epoll_ctl(epollfd, EPOLL_CTL_MOD, request->connfd, &write_ev) == -1){
                     print_log("could not rearm socket: %s\n", LOG_ERR, stderr, strerror(errno));
@@ -269,7 +277,7 @@ int8_t send_response(int epollfd, request_state *request, req_state_pool *pool, 
 }
 
 // Main server logic executed by workers
-void * handle_client(void *arg){
+void * server(void *arg){
     thread_args * args = (thread_args *)arg; // Thread arguments struct passed via ARG
     int16_t rv; // Used to temporarily store return values when needed
     struct epoll_event ev = {.events = epoll_read_flags}; // Default epoll event struct
@@ -335,7 +343,11 @@ void * handle_client(void *arg){
                     }
 
                     // Receive request
-                    if((rv = recv(req_state->connfd, req_state->buf, buffer_avail, 0)) == -1){
+                    do
+                        rv = recv(req_state->connfd, req_state->buf, buffer_avail, 0);
+                    while(rv == -1 && errno == EINTR);
+
+                    if(rv == -1){
                         if(errno == EAGAIN || errno == EWOULDBLOCK){
                             // Rearm socket
                             ev.data.ptr = req_state;
@@ -598,12 +610,12 @@ int main(int argc, char ** argv){
 
     for(uint8_t i = 1; i < tnum; i++){ // Core number - 1 because main thread becomes worker
         pthread_t tid;
-        pthread_create(&tid, NULL, handle_client, &args);
+        pthread_create(&tid, NULL, server, &args);
         pthread_detach(tid);
     }
 
     print_log("server started on port %d, number of threads: %d, log level: %s\n", LOG_INFO, stdout, portnum, tnum, log_level_str[log_level]);
 
     // Turn main thread into worker
-    handle_client(&args);
+    server(&args);
 }

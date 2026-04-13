@@ -673,6 +673,7 @@ void * server(void *arg){
 }
 
 int main(int argc, char ** argv){
+    char *server_dir = NULL;
     int portnum = 8080;
     int16_t backlog = BACKLOG, tnum = sysconf(_SC_NPROCESSORS_ONLN);
     thread_args args;
@@ -682,7 +683,7 @@ int main(int argc, char ** argv){
         if(argv[i][0] == '-')
             switch(argv[i][1]){
                 case 'h':
-                    printf("simple http server written in pure C\nusage: server [options]\n\toptions:\n\t\t-p\tPort to bind to (default: 8080)\n\t\t-m\tMaximum amount of headers accepted (default: 64)\n\t\t-b\tBacklog size (default: 128)\n\t\t-t\tNumber of threads (default: number of physical threads)\n");
+                    printf("simple multithreaded http server written in C.\nusage: server [-option] [value]\n\toptions:\n\t\t-p\tPort to bind to (default: 8080)\n\t\t-b\tBacklog size (default: 128)\n\t\t-t\tNumber of threads (default: number of physical threads)\n\t\t-l\tLog level (default: info, possible values: debug, info, warning, error)\n\t\t-d\tDirectory to serve files from. Files to serve are to be placed in this directory. (default: executable's directory)\n");
                     exit(0);
                 case 'p':
                     if((portnum = strtol(argv[i+1], NULL, 10)) > 65535 || portnum < 1 || errno != 0){
@@ -717,6 +718,9 @@ int main(int argc, char ** argv){
                     else
                         fprintf(stderr, "invalid log level provided. Try -h for help\n");
 
+                    continue;
+                case 'd':
+                    server_dir = argv[i+1];
                     continue;
             }
 
@@ -767,19 +771,21 @@ int main(int argc, char ** argv){
         exit(-1);
     }
 
-    // Find server executable path
-    static char server_path[MAX_PATH_LEN];
-    ssize_t path_len = readlink("/proc/self/exe", server_path, MAX_PATH_LEN - 1);
-    if(path_len < 0){
-        print_log("could not read server directory: %s\n", LOG_ERR, stderr, strerror(errno));
-        exit(-1);
+    if(server_dir == NULL){ // No server folder supplied, use default
+        // Find server executable path
+        static char server_path[MAX_PATH_LEN];
+        ssize_t path_len = readlink("/proc/self/exe", server_path, MAX_PATH_LEN - 1);
+        if(path_len < 0){
+            print_log("could not read server directory: %s\n", LOG_ERR, stderr, strerror(errno));
+            exit(-1);
+        }
+
+        server_path[path_len] = '\0';
+        server_dir = dirname(server_path);
     }
 
-    server_path[path_len] = '\0';
-    char *server_dir = dirname(server_path);
-
     if((args.root_fd = open(server_dir, O_RDONLY | O_DIRECTORY)) < 0){
-        print_log("could not open the server directory: %s\n", LOG_ERR, stderr, strerror(errno));
+        print_log("could not open server directory: %s\n", LOG_ERR, stderr, strerror(errno));
         exit(-1);
     }
 
@@ -790,7 +796,7 @@ int main(int argc, char ** argv){
         pthread_detach(tid);
     }
 
-    print_log("server started on port %d, number of threads: %d, log level: %s\n", LOG_INFO, stdout, portnum, tnum, log_level_str[log_level]);
+    print_log("server started on port %d, number of threads: %d, log level: %s, serving from directory: %s\n", LOG_INFO, stdout, portnum, tnum, log_level_str[log_level], server_dir);
 
     // Turn main thread into worker
     server(&args);

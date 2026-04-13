@@ -149,8 +149,6 @@ int8_t sendbody(req_state_pool *pool, request_state *request, int epollfd, ssize
     ssize_t sent;
     struct epoll_event write_ev = {epoll_write_flags, request}; // Used to rearm sockets for writes
 
-    print_log("sendbody called - offset: %ld, count: %ld\n", LOG_DEBUG, stdout, *offset, count);
-
     do{
         errno = 0;
         sent = sendfile(request->sockfd, request->body.fd, offset, count);
@@ -170,7 +168,6 @@ int8_t sendbody(req_state_pool *pool, request_state *request, int epollfd, ssize
         return -1;
     }
 
-    print_log("sendbody success\n", LOG_DEBUG, stdout);
     return 0;
 }
 
@@ -303,7 +300,6 @@ int8_t send_response(int epollfd, request_state *request, req_state_pool *pool, 
             while(request->ranges.ranges_sent < request->ranges.n_ranges){
                 multipart_header_sized_str *headers = request->ranges.multipart_pool + UUID_LEN;
 
-                print_log("sent: %ld, written: %ld\n", LOG_DEBUG, stdout, headers[request->ranges.ranges_sent].sent, headers[request->ranges.ranges_sent].written);
                 if(headers[request->ranges.ranges_sent].sent < headers[request->ranges.ranges_sent].written){
                     do{
                         errno = 0;
@@ -325,12 +321,9 @@ int8_t send_response(int epollfd, request_state *request, req_state_pool *pool, 
                     }
                 }
 
-                print_log("delimiter sent, range no: %d\n", LOG_DEBUG, stdout, request->ranges.ranges_sent);
-
                 if(sendbody(pool, request, epollfd, &request->ranges.arr[request->ranges.ranges_sent].start, request->ranges.arr[request->ranges.ranges_sent].end - request->ranges.arr[request->ranges.ranges_sent].start) == -1)
                     return -1;
 
-                print_log("range done\n", LOG_DEBUG, stdout);
                 request->ranges.ranges_sent++;
             }
 

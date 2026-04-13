@@ -1,6 +1,7 @@
-bin
+server
 resources
 *.html
 *.tmp
 *.sync-conflict*
-todo
+todo_
+build-debug.sh

@@ -1,9 +1,0 @@
-ipv6 support
-file browser
-logging inside functions
-fatal log level that exits from program
-maybe separate functions for different protocol versions
-support for CGI scripts (finally handle extensibility!)
-
-http/1.1 compliance:
-    range support

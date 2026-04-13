@@ -1,5 +1,4 @@
 #include "main.h"
-#include <unistd.h>
 
 static uint8_t log_level = LOG_INFO;
 static char *index_page = "/index.html";
@@ -102,12 +101,12 @@ int startsock(uint16_t port, uint8_t backlog){
     int sockfd = socket(AF_INET, SOCK_STREAM, 0), optval = 1;
 
     if(sockfd == -1){
-        print_log("%s: %s", LOG_ERR, stderr, "could not create socket\n", strerror(errno));
+        print_log("could not create socket: %s\n", LOG_ERR, stderr, strerror(errno));
         return -1;
     }
 
     if(setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)) == -1){
-        print_log("%s: %s", LOG_ERR, stderr, "setsockopt failed:\n", strerror(errno));
+        print_log("could not set REUSEADDR: %s\n", LOG_ERR, stderr, strerror(errno));
         close(sockfd);
         return -1;
     }
@@ -118,12 +117,12 @@ int startsock(uint16_t port, uint8_t backlog){
     addr.sin_port = htons(port);
 
     if(bind(sockfd, (struct sockaddr*)&addr, sizeof(addr)) != 0){
-        print_log("%s: %s", LOG_ERR, stderr, "could not bind to address\n", strerror(errno));
+        print_log("could not bind to address: %s\n", LOG_ERR, stderr, strerror(errno));
         return -1;
     }
 
     if((listen(sockfd, backlog)) != 0){
-        print_log("%s: %s", LOG_ERR, stderr, "could not listen on socket\n", strerror(errno));
+        print_log("could not listen on socket: %s\n", LOG_ERR, stderr, strerror(errno));
         return -1;
     }
 
@@ -146,132 +145,294 @@ int8_t setnonblocking(int sockfd){
     return 0;
 }
 
-// Send response to REQUEST, which is part of epoll instance EPOLLFD.
-// The STATUS_CODE argument will be ignored after the first function call (request is already sending)
-// Return 0 when done, -1 on partial write, -2 on error and -3 on invalid status code
+int8_t sendbody(req_state_pool *pool, request_state *request, int epollfd, ssize_t *offset, ssize_t count){
+    ssize_t sent;
+    struct epoll_event write_ev = {epoll_write_flags, request}; // Used to rearm sockets for writes
+
+    print_log("sendbody called - offset: %ld, count: %ld\n", LOG_DEBUG, stdout, *offset, count);
+
+    do{
+        errno = 0;
+        sent = sendfile(request->sockfd, request->body.fd, offset, count);
+    } while(sent == -1 && errno == EINTR);
+
+    if(sent <= 0){
+        if(errno == EAGAIN || errno == EWOULDBLOCK){
+            WRITE_REARM_OR_DIE;
+        } else{
+            print_log("could not send response body: %s\n", LOG_ERR, stderr, strerror(errno));
+            WRITE_ERR;
+        }
+    }
+
+    if(sent < count){
+        WRITE_REARM_OR_DIE;
+        return -1;
+    }
+
+    print_log("sendbody success\n", LOG_DEBUG, stdout);
+    return 0;
+}
+
+/*  Send response to REQUEST, which is part of epoll instance args.epollfd.
+    The STATUS_CODE argument will be ignored after the first function call (request is already sending)
+    Return 0 when done, -1 on partial write or error
+    Return values are currently unused but I'm keeping them in case I will need them for future changes */
 int8_t send_response(int epollfd, request_state *request, req_state_pool *pool, uint8_t status_code){
-    if(request->resp_header_sent == 0){ // Nothing sent yet, prepare response
+    if(request->resp_header.sent == 0){ // Nothing sent yet, prepare response
         char time_buf[TIME_BUF_SIZE];
         get_1123_date(time_buf, TIME_BUF_SIZE);
 
-        request->status_code = status_code;
+        if(request->ranges.n_ranges == 0)
+            request->status_code = status_code;
+        else if(status_code == OK)
+            request->status_code = PARTIAL_206;
 
         switch(request->status_code){
             case ERR_400:
-                request->resp_header_len = snprintf(request->response_header, RESPONSE_BUF_LEN, "HTTP/1.1 400 Bad Request\r\nDate: %s\r\nContent-Length: 24\r\nContent-Type: text/html%s\r\n\r\n<h1>400 Bad Request</h1>", time_buf, request->close_conn ? "\r\nConnection: close" : "");
+                request->resp_header.buf_len = snprintf(request->resp_header.buf, RESPONSE_BUF_LEN, "HTTP/1.1 400 Bad Request\r\nDate: %s\r\nContent-Length: 24\r\nContent-Type: text/html%s\r\n\r\n<h1>400 Bad Request</h1>", time_buf, request->close_conn ? "\r\nConnection: close" : "");
                 break;
             case ERR_500:
-                request->resp_header_len = snprintf(request->response_header, RESPONSE_BUF_LEN, "HTTP/1.1 500 Internal Server Error\r\nDate: %s\r\nContent-Length: 34\r\nContent-Type: text/html%s\r\n\r\n<h1>500 Internal Server Error</h1>", time_buf, request->close_conn ? "\r\nConnection: close" : "");
+                request->resp_header.buf_len = snprintf(request->resp_header.buf, RESPONSE_BUF_LEN, "HTTP/1.1 500 Internal Server Error\r\nDate: %s\r\nContent-Length: 34\r\nContent-Type: text/html%s\r\n\r\n<h1>500 Internal Server Error</h1>", time_buf, request->close_conn ? "\r\nConnection: close" : "");
                 break;
             case ERR_404:
-                request->resp_header_len = snprintf(request->response_header, RESPONSE_BUF_LEN, "HTTP/1.1 404 Not Found\r\nDate: %s\r\nContent-Length: 22\r\nContent-Type: text/html%s\r\n\r\n<h1>404 Not Found</h1>", time_buf, request->close_conn ? "\r\nConnection: close" : "");
+                request->resp_header.buf_len = snprintf(request->resp_header.buf, RESPONSE_BUF_LEN, "HTTP/1.1 404 Not Found\r\nDate: %s\r\nContent-Length: 22\r\nContent-Type: text/html%s\r\n\r\n<h1>404 Not Found</h1>", time_buf, request->close_conn ? "\r\nConnection: close" : "");
                 break;
             case ERR_405:
-                request->resp_header_len  = snprintf(request->response_header, RESPONSE_BUF_LEN, "HTTP/1.1 405 Method Not Allowed\r\nDate: %s\r\nAllow: GET, HEAD%s\r\n\r\n", time_buf, request->close_conn ? "\r\nConnection: close" : "");
+                request->resp_header.buf_len  = snprintf(request->resp_header.buf, RESPONSE_BUF_LEN, "HTTP/1.1 405 Method Not Allowed\r\nDate: %s\r\nAllow: GET, HEAD%s\r\n\r\n", time_buf, request->close_conn ? "\r\nConnection: close" : "");
                 break;
             case ERR_414:
-                request->resp_header_len  = snprintf(request->response_header, RESPONSE_BUF_LEN, "HTTP/1.1 414 URI Too Long\r\nDate: %s\r\nContent-Length: 25\r\nContent-Type: text/html%s\r\n\r\n<h1>414 URI Too Long</h1>", time_buf, request->close_conn ? "\r\nConnection: close" : "");
+                request->resp_header.buf_len  = snprintf(request->resp_header.buf, RESPONSE_BUF_LEN, "HTTP/1.1 414 URI Too Long\r\nDate: %s\r\nContent-Length: 25\r\nContent-Type: text/html%s\r\n\r\n<h1>414 URI Too Long</h1>", time_buf, request->close_conn ? "\r\nConnection: close" : "");
                 break;
             case ERR_304:
-                request->resp_header_len = snprintf(request->response_header, RESPONSE_BUF_LEN, "HTTP/1.1 304 Not Modified\r\nDate: %s%s\r\n\r\n", time_buf, request->close_conn ? "\r\nConnection: close" : "");
+                request->resp_header.buf_len = snprintf(request->resp_header.buf, RESPONSE_BUF_LEN, "HTTP/1.1 304 Not Modified\r\nDate: %s%s\r\n\r\n", time_buf, request->close_conn ? "\r\nConnection: close" : "");
                 break;
             case OK:
-                request->resp_header_len = snprintf(request->response_header, RESPONSE_BUF_LEN, "HTTP/1.1 200 OK\r\nDate: %s\r\nContent-Length: %ld\r\nContent-Type: %s%s\r\n\r\n", time_buf, request->fsize, request->mimetype, request->close_conn ? "\r\nConnection: close" : "");
+                request->resp_header.buf_len = snprintf(request->resp_header.buf, RESPONSE_BUF_LEN, "HTTP/1.1 200 OK\r\nDate: %s\r\nContent-Length: %ld\r\nContent-Type: %s\r\nAccept-Ranges: bytes%s\r\n\r\n", time_buf, request->body.fsize, request->mimetype, request->close_conn ? "\r\nConnection: close" : "");
+                break;
+            case PARTIAL_206:
+                if(request->ranges.n_ranges == 1)
+                    request->resp_header.buf_len = snprintf(request->resp_header.buf, RESPONSE_BUF_LEN, "HTTP/1.1 206 Partial Content\r\nDate: %s\r\nContent-Length: %ld\r\nContent-Type: %s\r\nContent-range: %ld-%ld/%ld%s\r\n\r\n", time_buf, request->ranges.total_size, request->mimetype, request->ranges.arr[0].start, request->ranges.arr[0].end, request->body.fsize, request->close_conn ? "\r\nConnection: close" : "");
+                else{
+                    /*  Allocate memory pool for all the data needed for the multipart response
+                        offsets:
+                        0 - uuid
+                        37 - headers
+
+                        remember to free this!!
+                    */
+                    char *uuid = request->ranges.multipart_pool = malloc(UUID_LEN + (request->ranges.n_ranges * sizeof(multipart_header_sized_str)));
+                    if(uuid == NULL){
+                        print_log("could not allocate multipart response memory pool: %s\n", LOG_ERR, stderr, strerror(errno));
+                        exit(-1);
+                    }
+
+                    if(uuidv4_gen(uuid) == NULL){
+                        print_log("could not generate UUID buffer for multipart request boundary: %s, exiting.\n", LOG_ERR, stderr, strerror(errno));
+                        exit(-1);
+                    }
+
+                    // Write headers
+                    multipart_header_sized_str *headers_buf = request->ranges.multipart_pool + UUID_LEN;
+                    for(uint8_t i = 0; i < request->ranges.n_ranges; i++){
+                        request->ranges.total_size += headers_buf[i].written = snprintf(headers_buf[i].str, MULTIPART_HEADER_LEN, i > 0 ? "\r\n--%s\r\nContent-Type: %s\r\nContent-Range: %ld-%ld/%ld\r\n\r\n" : "--%s\r\nContent-Type: %s\r\nContent-Range: %ld-%ld/%ld\r\n\r\n", (char *)uuid, request->mimetype, request->ranges.arr[i].start, request->ranges.arr[i].end, request->body.fsize);
+                        headers_buf[i].sent = 0;
+                    }
+
+                    request->resp_header.buf_len = snprintf(request->resp_header.buf, RESPONSE_BUF_LEN, "HTTP/1.1 206 Partial Content\r\nDate: %s\r\nContent-Length: %ld\r\nContent-Type: multipart/byteranges; boundary=%s%s\r\n\r\n", time_buf, request->ranges.total_size, (char *)uuid, request->close_conn ? "\r\nConnection: close" : "");
+                }
+
                 break;
             default:
-                return -3;
+                print_log("unrecognized response status code\n", LOG_ERR, stderr);
+                send_response(epollfd, request, pool, ERR_500);
         }
 
-        if(request->status_code != 0)
-            request->file = -1;
+        // If is error response and a file has been opened, close it
+        if(request->status_code != OK && request->status_code != PARTIAL_206 && request->body.fd > -1){
+            close(request->body.fd);
+            request->body.fd = -1;
+        }
+
         request->stage = WRITE;
     }
 
-    struct epoll_event write_ev = {epoll_write_flags, request}; // Used to rearm sockets for writes
-    struct epoll_event read_ev = {epoll_read_flags, request}; // Used to rearm sockets for reads
+    struct epoll_event write_ev = {epoll_write_flags, request}; // Used to rearm socket for writes
+    struct epoll_event read_ev = {epoll_read_flags, request}; // Used to rearm socket for reads
     ssize_t sent;
 
-    if(request->resp_header_sent < request->resp_header_len){
-        do
-            sent = send(request->connfd, request->response_header, request->resp_header_len - request->resp_header_sent, request->file > 0 ? MSG_MORE : 0);
-        while(sent == -1 && errno == EINTR);
+    if(request->resp_header.sent < request->resp_header.buf_len){
+        do{
+            errno = 0;
+            sent = send(request->sockfd, request->resp_header.buf + request->resp_header.sent, request->resp_header.buf_len - request->resp_header.sent, request->body.fd > 0 ? MSG_MORE : 0);
+        } while(sent == -1 && errno == EINTR);
 
-        if(sent == -1){
-            if(errno == EAGAIN || errno == EWOULDBLOCK){
-                if(epoll_ctl(epollfd, EPOLL_CTL_MOD, request->connfd, &write_ev) == -1){
-                    print_log("could not rearm socket: %s\n", LOG_ERR, stderr, strerror(errno));
-                    return -2;
-                }
-
-                return -1;
-            } else{
+        if(sent <= 0){
+            if(errno == EAGAIN || errno == EWOULDBLOCK)
+                WRITE_REARM_OR_DIE;
+            else {
                 print_log("could not send response header: %s\n", LOG_ERR, stderr, strerror(errno));
-                return -2;
+                WRITE_ERR;
             }
-        } else if(sent == 0){
-            req_state_pool_release(pool, request);
-            return -2;
         }
 
-        request->resp_header_sent += sent;
-
-        if(request->resp_header_sent < request->resp_header_len){
-            if(epoll_ctl(epollfd, EPOLL_CTL_MOD, request->connfd, &write_ev) == -1){
-                print_log("could not rearm socket: %s\n", LOG_ERR, stderr, strerror(errno));
-                return -2;
-            }
-
+        if((request->resp_header.sent += sent) < request->resp_header.buf_len){
+            WRITE_REARM_OR_DIE;
             return -1;
         }
     }
 
-    if(request->file > 0){ // If the response has a body, send it
-        do
-            sent = sendfile(request->connfd, request->file, &request->fsent, request->fsize - request->fsent);
-        while(sent == -1 && errno == EINTR);
+    if(request->body.fd > 0){ // If the response has a body, send it
+        if(request->ranges.n_ranges == 0){
+            if(sendbody(pool, request, epollfd, &request->body.fsent, request->body.fsize - request->body.fsent) == -1) return -1;
+        }
+        else if(request->ranges.n_ranges == 1){
+            if(sendbody(pool, request, epollfd, &request->ranges.arr[0].start, request->ranges.arr[0].end - request->ranges.arr[0].start) == -1) return -1;
+        } else{ // Is multipart response
+            int optval; // Used to cork and uncork socket
 
-        if(sent == -1){
-            if(errno == EAGAIN || errno == EWOULDBLOCK){
-                if(epoll_ctl(epollfd, EPOLL_CTL_MOD, request->connfd, &write_ev) == -1){
-                    print_log("could not rearm socket: %s\n", LOG_ERR, stderr, strerror(errno));
-                    return -2;
+            if(request->ranges.ranges_sent == 0){
+                // Cork socket
+                optval = 1;
+                if(setsockopt(request->sockfd, IPPROTO_TCP, TCP_CORK, &optval, sizeof(optval)) == -1){
+                    print_log("could not cork socket: %s\n", LOG_ERR, stderr, strerror(errno)); // Not sending error response as we've already sent part of the original response
+                    exit(-1);
+                }
+            }
+
+            while(request->ranges.ranges_sent < request->ranges.n_ranges){
+                multipart_header_sized_str *headers = request->ranges.multipart_pool + UUID_LEN;
+
+                print_log("sent: %ld, written: %ld\n", LOG_DEBUG, stdout, headers[request->ranges.ranges_sent].sent, headers[request->ranges.ranges_sent].written);
+                if(headers[request->ranges.ranges_sent].sent < headers[request->ranges.ranges_sent].written){
+                    do{
+                        errno = 0;
+                        sent = send(request->sockfd, headers[request->ranges.ranges_sent].str + headers[request->ranges.ranges_sent].sent, headers[request->ranges.ranges_sent].written - headers[request->ranges.ranges_sent].sent, 0);
+                    } while(sent == -1 && errno == EINTR);
+
+                    if(sent <= 0){
+                        if(errno == EAGAIN || errno == EWOULDBLOCK)
+                            WRITE_REARM_OR_DIE;
+                        else {
+                            print_log("could not send response header: %s\n", LOG_ERR, stderr, strerror(errno));
+                            WRITE_ERR;
+                        }
+                    }
+
+                    if((headers[request->ranges.ranges_sent].sent += sent) < headers[request->ranges.ranges_sent].written){
+                        WRITE_REARM_OR_DIE;
+                        return -1;
+                    }
                 }
 
-                return -1;
-            } else{
-                print_log("could not send response body: %s\n", LOG_ERR, stderr, strerror(errno));
-                return -2;
-            }
-        } else if(sent == 0){
-            req_state_pool_release(pool, request);
-            return -2;
-        }
+                print_log("delimiter sent, range no: %d\n", LOG_DEBUG, stdout, request->ranges.ranges_sent);
 
-        if(request->fsent < request->fsize){
-            if(epoll_ctl(epollfd, EPOLL_CTL_MOD, request->connfd, &write_ev) == -1){
-                print_log("could not rearm socket: %s\n", LOG_ERR, stderr, strerror(errno));
-                return -2;
+                if(sendbody(pool, request, epollfd, &request->ranges.arr[request->ranges.ranges_sent].start, request->ranges.arr[request->ranges.ranges_sent].end - request->ranges.arr[request->ranges.ranges_sent].start) == -1)
+                    return -1;
+
+                print_log("range done\n", LOG_DEBUG, stdout);
+                request->ranges.ranges_sent++;
             }
 
-            return -1;
-        } else {
-            close(request->file);
+            // Uncork socket
+            optval = 0;
+            if(setsockopt(request->sockfd, IPPROTO_TCP, TCP_CORK, &optval, sizeof(optval)) == -1){
+                print_log("could not uncork socket: %s\n", LOG_ERR, stderr, strerror(errno));
+                exit(-1);
+            }
+
+            // Free memory pool
+            free(request->ranges.multipart_pool);
         }
+
+        close(request->body.fd);
     }
+
+
+    if(request->status_code == ERR_500)
+        exit(-1);
 
     // Reset request state
-    request->buf_written = request->fsent = request->resp_header_sent = 0;
-    request->file = -1;
-    request->stage = READ;
+    reset_state(request);
 
-    if(!request->close_conn){
-        if(epoll_ctl(epollfd, EPOLL_CTL_MOD, request->connfd, &read_ev) == -1){
-            print_log("could not rearm socket: %s\n", LOG_ERR, stderr, strerror(errno));
-            return -2;
-        }
-    } else{
-        close(request->connfd);
+    if(request->close_conn)
+        close(request->sockfd);
+    else if(epoll_ctl(epollfd, EPOLL_CTL_MOD, request->sockfd, &read_ev) == -1){
+        print_log("could not rearm socket: %s\n", LOG_ERR, stderr, strerror(errno));
+        return -1;
     }
+
+    return 0;
+}
+
+// Parse and store value(s) from the Range header.
+// Return 0 on success and -1 on failure
+// This function's code is really messy and probably needs improvement
+int8_t parse_range(char *header_value, request_state *request){
+    uint8_t more; // True if there are more ranges to parse
+    char *next_value = header_value;
+
+    do{
+        if(request->ranges.n_ranges >= MAX_RANGES) return -1; // Maximum amount of ranges exceeded, ignore them
+
+        header_value = next_value;
+        more = (next_value = strchr(header_value, ',')) == NULL ? 0 : 1;
+        next_value++; // Skip comma
+
+        char *separator;
+        if((separator = strchr(header_value, '-')) == NULL)
+            return -1;
+
+        // Whitespace is only allowed if there are multiple values
+        if(request->ranges.n_ranges > 0)
+            while(isblank(*header_value)) header_value++;
+        else
+            if(isblank(*header_value)) return -1;
+
+        errno = 0; // Needed for strtol error handling
+        char *endptr; // Used to check for illegal characters in values
+
+        if(separator == header_value){ // Separator is at the start of the value, this is a suffix range
+            if(
+                isspace(*(header_value + 1)) ||
+                (request->ranges.arr[request->ranges.n_ranges].end = strtol(header_value + 1, &endptr, 10)) > request->body.fsize ||
+                ((*endptr != '\r' && *(endptr + 1) != '\n') && (more && (!isblank(*endptr) && *endptr != ','))) ||
+                errno == EINVAL || errno == ERANGE
+            ) return -1;
+
+            // Normalize range
+            request->ranges.arr[request->ranges.n_ranges].start = request->body.fsize - request->ranges.arr[request->ranges.n_ranges].end;
+            request->ranges.arr[request->ranges.n_ranges].end = request->body.fsize;
+        } else if((*(separator + 1) == '\r' && *(separator + 2) == '\n') || (more && (isblank(*separator + 1) || *(separator + 1) == ','))){ // Is open-ended range
+            if(
+                isspace(*header_value) ||
+                (request->ranges.arr[request->ranges.n_ranges].start = strtol(header_value, &endptr, 10)) >= request->body.fsize ||
+                endptr != separator ||
+                errno == EINVAL || errno == ERANGE
+            ) return -1;
+
+            // Normalize range
+            request->ranges.arr[request->ranges.n_ranges].end = request->body.fsize;
+        } else{ // Check if normal range
+            if(
+                (request->ranges.n_ranges == 0 && isspace(*header_value)) || // Whitespace before the value is only illegal if this is the first range (e.g. "bytes= 400-600")
+                (request->ranges.arr[request->ranges.n_ranges].start = strtol(header_value, &endptr, 10)) >= request->body.fsize ||
+                endptr != separator || // There must be no whitespace after the number, so the separator has to come immediately after
+                errno == EINVAL || errno == ERANGE
+            ) return -1;
+
+            errno = 0;
+
+            if(
+                isspace(*header_value) || // Whitespace after the separator is always illegal
+                (request->ranges.arr[request->ranges.n_ranges].end = strtol(separator + 1, NULL, 10)) > request->body.fsize ||
+                request->ranges.arr[request->ranges.n_ranges].start >= request->ranges.arr[request->ranges.n_ranges].end ||
+                errno == EINVAL || errno == ERANGE
+            ) return -1;
+        }
+
+        request->ranges.total_size += request->ranges.arr[request->ranges.n_ranges].end - request->ranges.arr[request->ranges.n_ranges++].start;
+    } while(more);
 
     return 0;
 }
@@ -279,7 +440,6 @@ int8_t send_response(int epollfd, request_state *request, req_state_pool *pool, 
 // Main server logic executed by workers
 void * server(void *arg){
     thread_args * args = (thread_args *)arg; // Thread arguments struct passed via ARG
-    int16_t rv; // Used to temporarily store return values when needed
     struct epoll_event ev = {.events = epoll_read_flags}; // Default epoll event struct
 
     while(1){
@@ -294,16 +454,16 @@ void * server(void *arg){
         }
 
         for(uint16_t i = 0; i < fds_n; i++){
-            request_state *req_state = (request_state *)args->events[i].data.ptr;
+            request_state *request = (request_state *)args->events[i].data.ptr;
 
-            if(req_state->connfd == args->listenfd){ // New connection
+            if(request->sockfd == args->listenfd){ // New connection
                 struct sockaddr addr;
                 socklen_t addrlen = sizeof(addr);
 
                 while(1){
                     // Accept connection
                     int sockfd;
-                    if((sockfd = accept(req_state->connfd, &addr, &addrlen)) == -1){
+                    if((sockfd = accept(request->sockfd, &addr, &addrlen)) == -1){
                         if(errno == EAGAIN || errno == EWOULDBLOCK)
                             break;
 
@@ -317,7 +477,7 @@ void * server(void *arg){
 
                     // Add socket to interest list
                     ev.data.ptr = req_state_pool_acquire(args->pool);
-                    ((request_state *)ev.data.ptr)->connfd = sockfd;
+                    ((request_state *)ev.data.ptr)->sockfd = sockfd;
                     if(epoll_ctl(args->epollfd, EPOLL_CTL_ADD, sockfd, &ev) == -1){
                         print_log("could not add socket to interest list: %s\n", LOG_ERR, stderr, strerror(errno));
                         continue;
@@ -334,79 +494,80 @@ void * server(void *arg){
                     print_log("got connection from: %s\n", LOG_INFO, stdout, client_addr);
                 }
            } else { // Handle request
-                if(req_state->stage == READ){
-                    uint16_t buffer_avail = REQ_BUF_SIZE - req_state->buf_written; // Number of free bytes left in the buffer
+                if(request->stage == READ){
+                    uint16_t buffer_avail = REQ_BUF_SIZE - request->req_buf.written; // Number of free bytes left in the buffer
 
                     if(buffer_avail == 0){ // Buffer is full, send error response
-                        send_response(args->epollfd, req_state, args->pool, ERR_400);
+                        send_response(args->epollfd, request, args->pool, ERR_400);
                         continue;
                     }
 
                     // Receive request
+                    int16_t sent;
                     do
-                        rv = recv(req_state->connfd, req_state->buf, buffer_avail, 0);
-                    while(rv == -1 && errno == EINTR);
+                        sent = recv(request->sockfd, request->req_buf.buf, buffer_avail, 0);
+                    while(sent == -1 && errno == EINTR);
 
-                    if(rv == -1){
+                    if(sent == -1){
                         if(errno == EAGAIN || errno == EWOULDBLOCK){
                             // Rearm socket
-                            ev.data.ptr = req_state;
-                            if(epoll_ctl(args->epollfd, EPOLL_CTL_MOD, req_state->connfd, &ev) == -1)
+                            ev.data.ptr = request;
+                            if(epoll_ctl(args->epollfd, EPOLL_CTL_MOD, request->sockfd, &ev) == -1)
                                 print_log("could not rearm socket: %s\n", LOG_ERR, stderr, strerror(errno));
                         } else{
                             print_log("could not recv from socket: %s\n", LOG_ERR, stderr, strerror(errno));
-                            req_state_pool_release(args->pool, req_state);
+                            req_state_pool_release(args->pool, request);
                         }
 
                         continue;
-                    } else if(rv == 0){
-                        req_state_pool_release(args->pool, req_state);
+                    } else if(sent == 0){
+                        req_state_pool_release(args->pool, request);
                         continue;
                     }
 
                     // Find end of request and NULL terminate it
                     char *end;
-                    if((end = memmem(req_state->buf + req_state->buf_written, rv, "\r\n\r\n", 4)) == NULL)
+                    if((end = memmem(request->req_buf.buf + request->req_buf.written, sent, "\r\n\r\n", 4)) == NULL)
                         continue;
-                    *end = '\0';
+                    *(end + 4) = '\0';
 
-                    req_state->buf_written += rv;
+                    request->req_buf.written += sent;
 
                     // Split request line for parsing
                     char *save_ptr, *path;
-                    if((req_state->method_str = strtok_r(req_state->buf, " ", &save_ptr)) == NULL || (path = strtok_r(NULL, " ", &save_ptr)) == NULL || (req_state->version_str = strtok_r(NULL, "\r\n", &save_ptr)) == NULL){
+                    if((request->method_str = strtok_r(request->req_buf.buf, " ", &save_ptr)) == NULL || (path = strtok_r(NULL, " ", &save_ptr)) == NULL || (request->version_str = strtok_r(NULL, "\r\n", &save_ptr)) == NULL){
                         print_log("malformed request line\n", LOG_ERR, stderr);
-                        send_response(args->epollfd, req_state, args->pool, ERR_400);
+                        send_response(args->epollfd, request, args->pool, ERR_400);
                         continue;
                     }
 
                     // Detect method
                     uint8_t method;
-                    if(strcmp(req_state->buf, "GET") == 0)
+                    if(strcmp(request->req_buf.buf, "GET") == 0)
                         method = GET;
-                    else if(strcmp(req_state->buf, "HEAD") == 0)
+                    else if(strcmp(request->req_buf.buf, "HEAD") == 0)
                         method = HEAD;
                     else{
-                        send_response(args->epollfd, req_state, args->pool, ERR_405);
+                        send_response(args->epollfd, request, args->pool, ERR_405);
                         continue;
                     }
 
                     // Detect protocol version
                     uint8_t ver;
-                    if(strcmp(req_state->version_str, "HTTP/1.1") == 0)
+                    if(strcmp(request->version_str, "HTTP/1.1") == 0)
                         ver = HTTP_1_1;
-                    else if(strcmp(req_state->version_str, "HTTP/1.0") == 0){
-                        req_state->close_conn = 1;
+                    else if(strcmp(request->version_str, "HTTP/1.0") == 0){
+                        request->close_conn = 1;
                         ver = HTTP_1_0;
                     } else{
-                        send_response(args->epollfd, req_state, args->pool, ERR_400);
+                        send_response(args->epollfd, request, args->pool, ERR_400);
                     }
 
-                    const char *headers = req_state->version_str + 10;
+                    const char *headers = request->version_str + 10;
 
                     char *host_header;
                     if(ver == HTTP_1_1 && (host_header = strcasestr(headers, "host:")) == NULL){
-                        send_response(args->epollfd, req_state, args->pool, ERR_400);
+                        send_response(args->epollfd, request, args->pool, ERR_400);
                         continue;
                     }
 
@@ -416,14 +577,14 @@ void * server(void *arg){
 
                         char *host;
                         if(strncasecmp(path, "http://", 7) != 0 || (path = strchr((host = path + 7), '/')) == NULL || strncasecmp(host, host_header, path - host) != 0){
-                            send_response(args->epollfd, req_state, args->pool, ERR_400);
+                            send_response(args->epollfd, request, args->pool, ERR_400);
                             continue;
                         }
                     }
 
                     // Check path len
                     if(strlen(path) > MAX_PATH_LEN){
-                        send_response(args->epollfd, req_state, args->pool, ERR_414);
+                        send_response(args->epollfd, request, args->pool, ERR_414);
                         continue;
                     }
 
@@ -437,19 +598,25 @@ void * server(void *arg){
                         .mode = 0,
                         .resolve = RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS | RESOLVE_NO_XDEV
                     };
-                    if((req_state->file = syscall(__NR_openat2, AT_FDCWD, path, &how, sizeof(how))) == -1){
-                        print_log("could not open file: %s\n", LOG_ERR, stderr, strerror(errno));
-                        send_response(args->epollfd, req_state, args->pool, errno == ENOENT ? ERR_404 : ERR_500);
+                    if((request->body.fd = syscall(__NR_openat2, args->root_fd, path, &how, sizeof(how))) == -1){
+                        print_log("could not open '%s' file: %s\n", LOG_ERR, stderr, path, strerror(errno));
+                        send_response(args->epollfd, request, args->pool, errno == ENOENT ? ERR_404 : ERR_500);
                         continue;
                     }
 
                     // Stat used to get file size and modification date
                     struct stat stat_buf;
-                    if(fstat(req_state->file, &stat_buf) == -1){
+                    if(fstat(request->body.fd, &stat_buf) == -1){
                         print_log("could not read file length: %s\n", LOG_ERR, stderr, strerror(errno));
-                        send_response(args->epollfd, req_state, args->pool, ERR_500);
+                        send_response(args->epollfd, request, args->pool, ERR_500);
                         continue;
                     }
+
+                    // Determine wether to send body
+                    if(method == HEAD)
+                        request->body.fd = -1;
+                    else
+                        request->body.fsize = stat_buf.st_size;
 
                     // Check header values
                     char *if_modified_since;
@@ -459,14 +626,23 @@ void * server(void *arg){
 
                         time_t header_timestamp;
                         if((header_timestamp = string_to_timestamp(if_modified_since)) < 0){
-                            send_response(args->epollfd, req_state, args->pool, ERR_400);
+                            send_response(args->epollfd, request, args->pool, ERR_400);
                             continue;
                         }
 
                         if(header_timestamp >= stat_buf.st_mtime){
-                            send_response(args->epollfd, req_state, args->pool, ERR_304);
+                            send_response(args->epollfd, request, args->pool, ERR_304);
                             continue;
                         }
+                    }
+
+                    char *range;
+                    if((range = strcasestr(headers, "range:")) != NULL){
+                        range += 6; // Skip header name
+                        while(isblank(*range)) range++; // Skip whitespace
+
+                        if(strncmp(range, "bytes=", 6) == 0 && parse_range(range += 6, request) == -1)
+                            request->ranges.n_ranges = 0;
                     }
 
                     char *connection_header;
@@ -475,9 +651,9 @@ void * server(void *arg){
                         while(isblank(*connection_header)) connection_header++; // Skip trailing whitespace
 
                         if(ver == HTTP_1_1 && strcasecmp(connection_header, "close") == 0)
-                            req_state->close_conn = 1;
+                            request->close_conn = 1;
                         else if(ver == HTTP_1_0)
-                            if(strcasecmp(connection_header, "keep-alive") == 0) req_state->close_conn = 0;
+                            if(strcasecmp(connection_header, "keep-alive") == 0) request->close_conn = 0;
                     }
 
                     // Determine body mime type
@@ -485,20 +661,16 @@ void * server(void *arg){
                     const char *extension;
 
                     if((extension = strrchr(path, '.')) != NULL && (bsearch_rv = bsearch(extension, mime_types, N_MIME_TYPES, sizeof(mime_type), strcmp_bsearch_wrapper)) != NULL)
-                        req_state->mimetype = bsearch_rv->mime_type;
+                        request->mimetype = bsearch_rv->mime_type;
                     else
-                        req_state->mimetype = "application/octet-stream";
+                        request->mimetype = "application/octet-stream";
 
-                    // Determine wether to send body
-                    if(method == HEAD)
-                        req_state->file = -1;
-                    else
-                        req_state->fsize = stat_buf.st_size;
+
                     // Send response
-                    send_response(args->epollfd, req_state, args->pool, OK);
-                } else if(req_state->stage == WRITE){
+                    send_response(args->epollfd, request, args->pool, OK);
+                } else if(request->stage == WRITE){
                     // Response is not done sending, continue
-                    send_response(args->epollfd, req_state, args->pool, OK);
+                    send_response(args->epollfd, request, args->pool, OK);
                 }
             }
         }
@@ -510,6 +682,7 @@ void * server(void *arg){
 int main(int argc, char ** argv){
     int portnum = 8080;
     int16_t backlog = BACKLOG, tnum = sysconf(_SC_NPROCESSORS_ONLN);
+    thread_args args;
 
     // Parse CLI args
     for(int i = 1; i < argc; i+=2){
@@ -559,28 +732,25 @@ int main(int argc, char ** argv){
     }
 
     // Allocate epoll event buffer
-    struct epoll_event *events_buf;
-    if((events_buf = malloc(MAX_EVENTS * sizeof(struct epoll_event))) == NULL){
+    if((args.events = malloc(MAX_EVENTS * sizeof(struct epoll_event))) == NULL){
         print_log("could not allocate epoll event buffer: %s\n", LOG_ERR, stderr, strerror(errno));
         exit(-1);
     }
 
     // Create epoll instance
-    int epollfd;
-    if((epollfd = epoll_create1(0)) == -1){
+    if((args.epollfd = epoll_create1(0)) == -1){
         print_log("could not create epoll fd: %s\n", LOG_ERR, stderr, strerror(errno));
         exit(-1);
     }
 
     // Start listening socket
-    int listening_socket;
-    if((listening_socket = startsock(portnum, backlog)) == -1){
+    if((args.listenfd = startsock(portnum, backlog)) == -1){
         print_log("could not create listening socket: %s\n", LOG_ERR, stderr, strerror(errno));
         exit(-1);
     }
 
     // Set listening socket to nonblocking
-    if(setnonblocking(listening_socket) == -1)
+    if(setnonblocking(args.listenfd) == -1)
         exit(-1);
 
     // Add listening socket to interest list
@@ -590,17 +760,13 @@ int main(int argc, char ** argv){
         print_log("could not allocate request_state struct for listening socket: %s\n", LOG_ERR, stderr, strerror(errno));
         exit(-1);
     }
-    (*(request_state *)ev.data.ptr).connfd = listening_socket;
+    (*(request_state *)ev.data.ptr).sockfd = args.listenfd;
     ev.events = EPOLLIN | EPOLLET;
 
-    if(epoll_ctl(epollfd, EPOLL_CTL_ADD, listening_socket, &ev) == -1){
+    if(epoll_ctl(args.epollfd, EPOLL_CTL_ADD, args.listenfd, &ev) == -1){
         print_log("could not add listening socket to interest list: %s\n", LOG_ERR, stderr, strerror(errno));
         exit(-1);
     }
-
-    // Start worker threads
-
-    thread_args args = {.epollfd = epollfd, .listenfd = listening_socket, .events = events_buf};
 
     // Allocate memory pool for request state
     if((args.pool = req_state_pool_alloc(MAX_EVENTS)) == NULL){
@@ -608,6 +774,23 @@ int main(int argc, char ** argv){
         exit(-1);
     }
 
+    // Find server executable path
+    static char server_path[MAX_PATH_LEN];
+    ssize_t path_len = readlink("/proc/self/exe", server_path, MAX_PATH_LEN - 1);
+    if(path_len < 0){
+        print_log("could not read server directory: %s\n", LOG_ERR, stderr, strerror(errno));
+        exit(-1);
+    }
+
+    server_path[path_len] = '\0';
+    char *server_dir = dirname(server_path);
+
+    if((args.root_fd = open(server_dir, O_RDONLY | O_DIRECTORY)) < 0){
+        print_log("could not open the server directory: %s\n", LOG_ERR, stderr, strerror(errno));
+        exit(-1);
+    }
+
+    // Start worker threads
     for(uint8_t i = 1; i < tnum; i++){ // Core number - 1 because main thread becomes worker
         pthread_t tid;
         pthread_create(&tid, NULL, server, &args);

@@ -24,8 +24,11 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <sys/epoll.h>
+#include <netinet/tcp.h>
+#include <libgen.h>
 
 #include "state_pool.h"
+#include "uuidv4.h"
 
 #define N_MIME_TYPES 20
 #define MAX_HEADER_VALUES 16
@@ -35,6 +38,23 @@
 #define TIME_BUF_SIZE 40
 #define MAX_EVENTS 512
 #define MAX_PATH_LEN 256
+#define UUID_LEN 40 // 3 bytes larger to allow for pointer alignment in memory pool
+
+// Rearm socket for write or exit on failure
+#define WRITE_REARM_OR_DIE \
+    do{ \
+        if(epoll_ctl(epollfd, EPOLL_CTL_MOD, request->sockfd, &write_ev) == -1){ \
+            print_log("could not rearm socket: %s, exiting.\n", LOG_ERR, stderr, strerror(errno)); \
+            exit(-1); \
+        } \
+    } while(0)
+
+// Write error handling
+#define WRITE_ERR \
+    if(errno != EPIPE) \
+        exit(-1); \
+    req_state_pool_release(pool, request); \
+    return -1; \
 
 enum log_level {
     LOG_DEBUG,
@@ -64,9 +84,9 @@ typedef struct {
 } date_enum;
 
 typedef struct {
-    int epollfd, listenfd;
     struct epoll_event *events;
     req_state_pool *pool;
+    int epollfd, listenfd, root_fd;
 } thread_args;
 
 static mime_type mime_types[N_MIME_TYPES] = {
